@@ -1,7 +1,7 @@
 FROM gradle:8.4-jdk17 AS backend-build
 WORKDIR /app
 
-COPY . .  
+COPY ./twitchbe .  
 
 RUN gradle clean build -x test
 
