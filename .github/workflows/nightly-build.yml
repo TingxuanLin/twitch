@@ -255,6 +255,11 @@ jobs:
         run: |
           echo "${{ secrets.EC2_SSH_KEY }}" > labsuser.pem
           chmod 400 labsuser.pem
+          mkdir -p ~/.ssh
+          echo "Host *
+            StrictHostKeyChecking no
+            UserKnownHostsFile=/dev/null" > ~/.ssh/config
+          chmod 600 ~/.ssh/config
 
       - name: Start a temporary EC2 instance
         id: start_ec2
@@ -266,6 +271,7 @@ jobs:
             --key-name vockey \
             --security-group-ids sg-01d9849f009a95731 \
             --subnet-id subnet-0d19fbf0bf001c3b2 \
+            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=TempIntegrationTest}]' \
             --query "Instances[0].InstanceId" \
             --output text)
           echo "EC2_INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
@@ -274,7 +280,7 @@ jobs:
         run: |
           aws ec2 wait instance-status-ok --instance-ids $EC2_INSTANCE_ID
           # Add extra time for SSH service to start
-          sleep 60
+          sleep 90
 
       - name: Get EC2 Public IP
         id: get_ec2_ip
@@ -286,37 +292,94 @@ jobs:
           echo "EC2_PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
           echo "EC2 Public IP: $PUBLIC_IP"
 
-      - name: Set up SSH config to skip host key checking
+      - name: Create AWS credential files
         run: |
-          mkdir -p ~/.ssh
-          echo "Host *
-            StrictHostKeyChecking no
-            UserKnownHostsFile=/dev/null" > ~/.ssh/config
-          chmod 600 ~/.ssh/config
+          mkdir -p aws_temp
 
-      - name: SSH into EC2 and run tests
-        run: |
-          # Create AWS credentials file
-          cat > aws_config << EOF
+          # Create AWS config
+          cat > aws_temp/config << EOF
           [default]
           region=${{ env.AWS_REGION }}
           EOF
 
-          cat > aws_credentials << EOF
+          # Create AWS credentials
+          cat > aws_temp/credentials << EOF
           [default]
           aws_access_key_id=${{ secrets.AWS_ACCESS_KEY_ID }}
           aws_secret_access_key=${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws_session_token=${{ secrets.AWS_SESSION_TOKEN }}
           EOF
 
-          # Copy AWS credentials to the EC2 instance
+          # Create docker-compose.yml
+          cat > aws_temp/docker-compose.yml << EOF
+          version: "3.8"
+          services:
+            db:
+              image: mysql:latest
+              environment:
+                MYSQL_ROOT_HOST: "%"
+                MYSQL_DATABASE: twitch
+                MYSQL_ROOT_PASSWORD: secret
+                TZ: UTC
+              ports:
+                - "3306:3306"
+              networks:
+                - app-network
+            backend:
+              image: ${{ env.AWS_ECR_URI }}/backend:latest
+              environment:
+                SPRING_DATASOURCE_URL: jdbc:mysql://db:3306/twitch
+                SPRING_DATASOURCE_USERNAME: root
+                SPRING_DATASOURCE_PASSWORD: secret
+                SPRING_PROFILES_ACTIVE: prod
+              ports:
+                - "8080:8080"
+              depends_on:
+                - db
+              networks:
+                - app-network
+            frontend:
+              image: ${{ env.AWS_ECR_URI }}/frontend:latest
+              ports:
+                - "80:80"
+              depends_on:
+                - backend
+              networks:
+                - app-network
+          networks:
+            app-network:
+              driver: bridge
+          EOF
+
+      - name: Check if SSH is available
+        run: |
+          # Keep trying to connect until it works or times out
+          for i in {1..10}; do
+            if ssh -i labsuser.pem ec2-user@$EC2_PUBLIC_IP "echo SSH connection successful"; then
+              echo "SSH connection established!"
+              break
+            else
+              echo "SSH connection failed. Retrying in 10 seconds... (Attempt $i of 10)"
+              sleep 10
+            fi
+          done
+
+      - name: Copy files to EC2
+        run: |
+          # Create .aws directory on EC2
           ssh -i labsuser.pem ec2-user@$EC2_PUBLIC_IP "mkdir -p ~/.aws"
-          scp -i labsuser.pem aws_config ec2-user@$EC2_PUBLIC_IP:~/.aws/config
-          scp -i labsuser.pem aws_credentials ec2-user@$EC2_PUBLIC_IP:~/.aws/credentials
+
+          # Copy AWS config files
+          scp -i labsuser.pem aws_temp/config ec2-user@$EC2_PUBLIC_IP:~/.aws/config
+          scp -i labsuser.pem aws_temp/credentials ec2-user@$EC2_PUBLIC_IP:~/.aws/credentials
           ssh -i labsuser.pem ec2-user@$EC2_PUBLIC_IP "chmod 600 ~/.aws/credentials"
 
-          # Main testing script
-          ssh -i labsuser.pem ec2-user@$EC2_PUBLIC_IP << EOF
+          # Copy docker-compose.yml
+          scp -i labsuser.pem aws_temp/docker-compose.yml ec2-user@$EC2_PUBLIC_IP:~/docker-compose.yml
+
+      - name: Set up EC2 and run tests
+        run: |
+          ssh -i labsuser.pem ec2-user@$EC2_PUBLIC_IP "bash -s" << 'EOF'
             # Install Docker and dependencies
             sudo yum update -y
             sudo yum install -y docker
@@ -325,63 +388,22 @@ jobs:
             sudo usermod -a -G docker ec2-user
             
             # Install docker-compose
-            sudo curl -L "https://github.com/docker/compose/releases/download/v2.20.3/docker-compose-\$(uname -s)-\$(uname -m)" -o /usr/local/bin/docker-compose
+            sudo curl -L "https://github.com/docker/compose/releases/download/v2.20.3/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
             sudo chmod +x /usr/local/bin/docker-compose
             
             # Verify AWS credentials
             aws sts get-caller-identity
             
             # Login to ECR with proper credentials
-            aws ecr get-login-password --region ${{ env.AWS_REGION }} | sudo docker login --username AWS --password-stdin ${{ env.AWS_ECR_URI }}
+            aws ecr get-login-password --region ${AWS_REGION} | sudo docker login --username AWS --password-stdin ${AWS_ECR_URI}
             
             # Pull the latest images from ECR
             echo "Pulling frontend image from ECR..."
-            sudo docker pull ${{ env.AWS_ECR_URI }}/frontend:latest
+            sudo docker pull ${AWS_ECR_URI}/frontend:latest
             
             echo "Pulling backend image from ECR..."
-            sudo docker pull ${{ env.AWS_ECR_URI }}/backend:latest
+            sudo docker pull ${AWS_ECR_URI}/backend:latest
 
-            # Create docker-compose.yml file
-            cat > docker-compose.yml << 'EOFDC'
-            version: "3.8"
-            services:
-              db:
-                image: mysql:latest
-                environment:
-                  MYSQL_ROOT_HOST: "%"
-                  MYSQL_DATABASE: twitch
-                  MYSQL_ROOT_PASSWORD: secret
-                  TZ: UTC
-                ports:
-                  - "3306:3306"
-                networks:
-                  - app-network
-              backend:
-                image: ${{ env.AWS_ECR_URI }}/backend:latest
-                environment:
-                  SPRING_DATASOURCE_URL: jdbc:mysql://db:3306/twitch
-                  SPRING_DATASOURCE_USERNAME: root
-                  SPRING_DATASOURCE_PASSWORD: secret
-                  SPRING_PROFILES_ACTIVE: prod
-                ports:
-                  - "8080:8080"
-                depends_on:
-                  - db
-                networks:
-                  - app-network
-              frontend:
-                image: ${{ env.AWS_ECR_URI }}/frontend:latest
-                ports:
-                  - "80:80"
-                depends_on:
-                  - backend
-                networks:
-                  - app-network
-            networks:
-              app-network:
-                driver: bridge
-            EOFDC
-            
             # Start services
             echo "Starting services with docker-compose..."
             sudo docker-compose up -d
@@ -396,33 +418,25 @@ jobs:
             # Test frontend
             echo "Testing frontend health endpoint..."
             FRONTEND_STATUS=0
-            curl -v http://localhost:80/health || FRONTEND_STATUS=\$?
+            curl -v http://localhost:80/health || FRONTEND_STATUS=$?
             
             # Test backend
             echo "Testing backend health endpoint..."
             BACKEND_STATUS=0
-            curl -v http://localhost:8080/actuator/health || BACKEND_STATUS=\$?
+            curl -v http://localhost:8080/actuator/health || BACKEND_STATUS=$?
             
             # Return overall status
-            if [ \$FRONTEND_STATUS -eq 0 ] && [ \$BACKEND_STATUS -eq 0 ]; then
+            if [ $FRONTEND_STATUS -eq 0 ] && [ $BACKEND_STATUS -eq 0 ]; then
               echo "Integration tests passed!"
               exit 0
             else
-              echo "Integration tests failed! Frontend status: \$FRONTEND_STATUS, Backend status: \$BACKEND_STATUS"
+              echo "Integration tests failed! Frontend status: $FRONTEND_STATUS, Backend status: $BACKEND_STATUS"
               # Show logs for debugging
               echo "Container logs:"
               sudo docker-compose logs
               exit 1
             fi
           EOF
-
-      # Remove the images from ECR if tests fail
-      - name: Remove Images from ECR if Tests Fail
-        if: failure()
-        run: |
-          echo "Tests failed, removing images from ECR..."
-          aws ecr batch-delete-image --repository-name frontend --image-ids imageTag=latest
-          aws ecr batch-delete-image --repository-name backend --image-ids imageTag=latest
 
       # Terminate EC2 Instance
       - name: Terminate EC2 Instance
@@ -452,267 +466,312 @@ jobs:
         run: |
           echo "${{ secrets.EC2_SSH_KEY }}" > qa_key.pem
           chmod 400 qa_key.pem
-
-      - name: Set up SSH config to skip host key checking
-        run: |
           mkdir -p ~/.ssh
           echo "Host *
             StrictHostKeyChecking no
             UserKnownHostsFile=/dev/null" > ~/.ssh/config
           chmod 600 ~/.ssh/config
 
-      - name: Deploy New Images to QA Environment with SSL
+      - name: Create deployment files
         run: |
-          # Create AWS credentials file
-          cat > aws_config << EOF
+          mkdir -p deploy_files
+
+          # Create AWS config
+          cat > deploy_files/config << EOF
           [default]
           region=${{ env.AWS_REGION }}
           EOF
 
-          cat > aws_credentials << EOF
+          # Create AWS credentials
+          cat > deploy_files/credentials << EOF
           [default]
           aws_access_key_id=${{ secrets.AWS_ACCESS_KEY_ID }}
           aws_secret_access_key=${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws_session_token=${{ secrets.AWS_SESSION_TOKEN }}
           EOF
 
-          # Copy AWS credentials to the EC2 instance
-          ssh -i qa_key.pem ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }} "mkdir -p ~/.aws"
-          scp -i qa_key.pem aws_config ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }}:~/.aws/config
-          scp -i qa_key.pem aws_credentials ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }}:~/.aws/credentials
+          # Create nginx.conf template
+          cat > deploy_files/nginx.conf << 'EOF'
+          events {}
+
+          http {
+              include /etc/nginx/mime.types;
+              default_type application/octet-stream;
+              server_tokens off;
+
+              # Redirect HTTP to HTTPS
+              server {
+                  listen 80;
+                  server_name SERVER_NAME_PLACEHOLDER;
+                  return 301 https://$host$request_uri;
+              }
+
+              # HTTPS server block
+              server {
+                  listen 443 ssl;
+                  server_name SERVER_NAME_PLACEHOLDER;
+                  
+                  # SSL Certificate Configuration
+                  ssl_certificate /etc/letsencrypt/live/SERVER_NAME_PLACEHOLDER/fullchain.pem;
+                  ssl_certificate_key /etc/letsencrypt/live/SERVER_NAME_PLACEHOLDER/privkey.pem;
+                  ssl_protocols TLSv1.2 TLSv1.3;
+                  ssl_prefer_server_ciphers on;
+                  
+                  # Serve React frontend
+                  location / {
+                      root /usr/share/nginx/html;  # Path to React build files
+                      try_files $uri /index.html;  # Ensure all routes go to index.html
+                  }
+
+                  # Forward API requests to backend
+                  location /login {
+                      proxy_pass http://backend:8080;
+                      proxy_set_header Host $host;
+                      proxy_set_header X-Real-IP $remote_addr;
+                      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                      proxy_set_header X-Forwarded-Proto $scheme;
+                  }
+
+                  location /register {
+                      proxy_pass http://backend:8080;
+                      proxy_set_header Host $host;
+                      proxy_set_header X-Real-IP $remote_addr;
+                      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                      proxy_set_header X-Forwarded-Proto $scheme;
+                  }
+
+                  location /logout {
+                      proxy_pass http://backend:8080;
+                      proxy_set_header Host $host;
+                      proxy_set_header X-Real-IP $remote_addr;
+                      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                      proxy_set_header X-Forwarded-Proto $scheme;
+                  }
+
+                  location /game {
+                      proxy_pass http://backend:8080;
+                      proxy_set_header Host $host;
+                      proxy_set_header X-Real-IP $remote_addr;
+                      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                      proxy_set_header X-Forwarded-Proto $scheme;
+                  }
+
+                  location /search {
+                      proxy_pass http://backend:8080;
+                      proxy_set_header Host $host;
+                      proxy_set_header X-Real-IP $remote_addr;
+                      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                      proxy_set_header X-Forwarded-Proto $scheme;
+                  }
+
+                  location /favorite {
+                      proxy_pass http://backend:8080;
+                      proxy_set_header Host $host;
+                      proxy_set_header X-Real-IP $remote_addr;
+                      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                      proxy_set_header X-Forwarded-Proto $scheme;
+                  }
+
+                  location /recommendation {
+                      proxy_pass http://backend:8080;
+                      proxy_set_header Host $host;
+                      proxy_set_header X-Real-IP $remote_addr;
+                      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                      proxy_set_header X-Forwarded-Proto $scheme;
+                  }
+
+                  # Serve static assets
+                  location /static/ {
+                      root /usr/share/nginx/html;
+                  }
+              }
+          }
+          EOF
+
+          # Create frontend Dockerfile template
+          cat > deploy_files/Dockerfile.frontend.ssl << 'EOF'
+          FROM FRONTEND_IMAGE_PLACEHOLDER
+          COPY nginx.conf /etc/nginx/nginx.conf
+          EXPOSE 80 443
+          CMD ["nginx", "-g", "daemon off;"]
+          EOF
+
+          # Create deployment script
+          cat > deploy_files/deploy.sh << 'EOF'
+          #!/bin/bash
+          set -e
+
+          # Install Docker if not already installed
+          if ! command -v docker &> /dev/null; then
+            echo "Installing Docker..."
+            sudo dnf update -y
+            sudo dnf install docker -y
+            sudo systemctl start docker
+            sudo systemctl enable docker
+            sudo usermod -a -G docker ec2-user
+          else
+            echo "Docker is already installed"
+          fi
+
+          # Install Docker Compose if not already installed
+          if ! command -v docker-compose &> /dev/null; then
+            echo "Installing Docker Compose..."
+            sudo curl -L "https://github.com/docker/compose/releases/download/v2.20.3/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            sudo chmod +x /usr/local/bin/docker-compose
+            sudo ln -s /usr/local/bin/docker-compose /usr/bin/docker-compose
+          else
+            echo "Docker Compose is already installed"
+          fi
+
+          # Install Certbot
+          echo "Installing Certbot..."
+          sudo dnf install -y certbot
+
+          # Get instance public DNS and IP
+          EC2_PUBLIC_DNS=$(curl -s http://169.254.169.254/latest/meta-data/public-hostname)
+          EC2_PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+          echo "Public DNS: $EC2_PUBLIC_DNS"
+          echo "Public IP: $EC2_PUBLIC_IP"
+
+          # Login to ECR
+          echo "Logging in to ECR..."
+          aws ecr get-login-password --region $AWS_REGION | sudo docker login --username AWS --password-stdin $AWS_ECR_URI
+
+          # Pull latest images
+          echo "Pulling latest images from ECR..."
+          sudo docker pull $AWS_ECR_URI/frontend:latest
+          sudo docker pull $AWS_ECR_URI/backend:latest
+
+          # Stop running containers
+          echo "Stopping current containers..."
+          sudo docker-compose down || true
+
+          # Stop any services using port 80 or 443
+          sudo fuser -k 80/tcp || true
+          sudo fuser -k 443/tcp || true
+
+          # Obtain SSL certificate
+          echo "Obtaining SSL certificate..."
+          sudo certbot certonly --standalone \
+            --non-interactive --agree-tos \
+            --staging \
+            --email your-email@example.com \
+            -d $EC2_PUBLIC_DNS
+
+          if [ ! -d "/etc/letsencrypt/live/$EC2_PUBLIC_DNS" ]; then
+            echo "Creating self-signed certificate..."
+            sudo mkdir -p /etc/letsencrypt/live/$EC2_PUBLIC_DNS
+            sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+              -keyout /etc/letsencrypt/live/$EC2_PUBLIC_DNS/privkey.pem \
+              -out /etc/letsencrypt/live/$EC2_PUBLIC_DNS/fullchain.pem \
+              -subj "/CN=$EC2_PUBLIC_DNS"
+          fi
+
+          # Update nginx.conf with actual server name
+          echo "Configuring nginx..."
+          sed -i "s|SERVER_NAME_PLACEHOLDER|$EC2_PUBLIC_DNS|g" nginx.conf
+
+          # Update Dockerfile with actual frontend image
+          sed -i "s|FRONTEND_IMAGE_PLACEHOLDER|$AWS_ECR_URI/frontend:latest|g" Dockerfile.frontend.ssl
+
+          # Build custom frontend image
+          echo "Building frontend with SSL..."
+          sudo docker build -t frontend-ssl:latest -f Dockerfile.frontend.ssl .
+
+          # Create docker-compose.yml
+          echo "Creating docker-compose.yml..."
+          cat > docker-compose.yml << EOFYML
+          version: "3.8"
+          services:
+            backend:
+              image: $AWS_ECR_URI/backend:latest
+              environment:
+                SPRING_DATASOURCE_URL: jdbc:mysql://$RDS_ENDPOINT/twitch
+                SPRING_DATASOURCE_USERNAME: $RDS_USERNAME
+                SPRING_DATASOURCE_PASSWORD: $RDS_PASSWORD
+                SPRING_PROFILES_ACTIVE: prod
+              ports:
+                - "8080:8080"
+              networks:
+                - app-network
+            
+            frontend:
+              image: frontend-ssl:latest
+              volumes:
+                - /etc/letsencrypt:/etc/letsencrypt:ro
+              ports:
+                - "80:80"
+                - "443:443"
+              depends_on:
+                - backend
+              networks:
+                - app-network
+
+          networks:
+            app-network:
+              driver: bridge
+          EOFYML
+
+          # Setup certificate renewal
+          echo "Setting up certificate renewal..."
+          sudo bash -c 'echo "0 0,12 * * * root python3 -c '\''import random; import time; time.sleep(random.random() * 3600)'\'' && certbot renew -q" > /etc/cron.d/certbot-renew'
+
+          # Start containers
+          echo "Starting containers..."
+          sudo docker-compose up -d
+
+          # Wait for services to start
+          echo "Waiting for services to start..."
+          sleep 30
+
+          # Check services
+          echo "Checking service health..."
+          curl -k https://localhost/health || echo "Frontend health check failed, but continuing..."
+          curl -s http://localhost:8080/actuator/health || echo "Backend health check failed, but continuing..."
+
+          echo "Deployment complete!"
+          echo "Your application is available at:"
+          echo "- HTTP: http://$EC2_PUBLIC_DNS (redirects to HTTPS)"
+          echo "- HTTPS: https://$EC2_PUBLIC_DNS"
+          EOF
+
+          chmod +x deploy_files/deploy.sh
+
+      - name: Check QA instance availability
+        run: |
+          # Test connection
+          for i in {1..5}; do
+            if ping -c 1 ${{ secrets.EC2_QA_PUBLIC_IP }} > /dev/null 2>&1; then
+              echo "QA instance is reachable"
+              break
+            else
+              echo "QA instance not reachable. Retrying in 10 seconds... (Attempt $i of 5)"
+              sleep 10
+            fi
+          done
+
+          # Test SSH connection
+          for i in {1..5}; do
+            if ssh -i qa_key.pem ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }} "echo SSH connection successful"; then
+              echo "SSH connection established!"
+              break
+            else
+              echo "SSH connection failed. Retrying in 10 seconds... (Attempt $i of 5)"
+              sleep 10
+            fi
+          done
+
+      - name: Copy deployment files
+        run: |
+          ssh -i qa_key.pem ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }} "mkdir -p ~/.aws deploy_temp"
+          scp -i qa_key.pem deploy_files/config ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }}:~/.aws/config
+          scp -i qa_key.pem deploy_files/credentials ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }}:~/.aws/credentials
           ssh -i qa_key.pem ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }} "chmod 600 ~/.aws/credentials"
 
-          # Main deployment script
-          ssh -i qa_key.pem ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }} << EOF
-            # Install Docker if not already installed
-            if ! command -v docker &> /dev/null; then
-              echo "Installing Docker..."
-              sudo dnf update -y
-              sudo dnf install docker -y
-              sudo systemctl start docker
-              sudo systemctl enable docker
-              sudo usermod -a -G docker ec2-user
-            else
-              echo "Docker is already installed"
-            fi
-            
-            # Install Docker Compose if not already installed
-            if ! command -v docker-compose &> /dev/null; then
-              echo "Installing Docker Compose..."
-              sudo curl -L "https://github.com/docker/compose/releases/download/v2.20.3/docker-compose-\$(uname -s)-\$(uname -m)" -o /usr/local/bin/docker-compose
-              sudo chmod +x /usr/local/bin/docker-compose
-              sudo ln -s /usr/local/bin/docker-compose /usr/bin/docker-compose
-            else
-              echo "Docker Compose is already installed"
-            fi
-            
-            # Install Certbot for SSL
-            echo "Installing Certbot..."
-            sudo dnf install -y certbot
-            
-            # Get instance public DNS and IP
-            EC2_PUBLIC_DNS=\$(curl -s http://169.254.169.254/latest/meta-data/public-hostname)
-            EC2_PUBLIC_IP=\$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
-            echo "Public DNS: \$EC2_PUBLIC_DNS"
-            echo "Public IP: \$EC2_PUBLIC_IP"
-            
-            # Login to ECR
-            echo "Logging in to ECR..."
-            aws ecr get-login-password --region ${{ env.AWS_REGION }} | sudo docker login --username AWS --password-stdin ${{ env.AWS_ECR_URI }}
-            
-            # Pull latest images
-            echo "Pulling latest images from ECR..."
-            sudo docker pull ${{ env.AWS_ECR_URI }}/frontend:latest
-            sudo docker pull ${{ env.AWS_ECR_URI }}/backend:latest
-            
-            # Stop running containers
-            echo "Stopping current containers..."
-            sudo docker-compose down || true
-            
-            # Stop any services using port 80
-            sudo fuser -k 80/tcp || true
-            
-            # Obtain SSL certificate (using --staging flag for testing)
-            echo "Obtaining SSL certificate..."
-            sudo certbot certonly --standalone \
-              --non-interactive --agree-tos \
-              --staging \
-              --email your-email@example.com \
-              -d \$EC2_PUBLIC_DNS
-            
-            if [ ! -d "/etc/letsencrypt/live/\$EC2_PUBLIC_DNS" ]; then
-              echo "Using self-signed certificate for testing..."
-              sudo mkdir -p /etc/letsencrypt/live/\$EC2_PUBLIC_DNS
-              sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-                -keyout /etc/letsencrypt/live/\$EC2_PUBLIC_DNS/privkey.pem \
-                -out /etc/letsencrypt/live/\$EC2_PUBLIC_DNS/fullchain.pem \
-                -subj "/CN=\$EC2_PUBLIC_DNS"
-            fi
-            
-            # Create nginx.conf with SSL support
-            echo "Creating nginx configuration..."
-            cat > nginx.conf << EOFNGINX
-            events {}
-            
-            http {
-                include /etc/nginx/mime.types;
-                default_type application/octet-stream;
-                server_tokens off;
-            
-                # Redirect HTTP to HTTPS
-                server {
-                    listen 80;
-                    server_name \$EC2_PUBLIC_DNS;
-                    return 301 https://\$host\$request_uri;
-                }
-            
-                # HTTPS server block
-                server {
-                    listen 443 ssl;
-                    server_name \$EC2_PUBLIC_DNS;
-                    
-                    # SSL Certificate Configuration
-                    ssl_certificate /etc/letsencrypt/live/\$EC2_PUBLIC_DNS/fullchain.pem;
-                    ssl_certificate_key /etc/letsencrypt/live/\$EC2_PUBLIC_DNS/privkey.pem;
-                    ssl_protocols TLSv1.2 TLSv1.3;
-                    ssl_prefer_server_ciphers on;
-                    
-                    # Serve React frontend
-                    location / {
-                        root /usr/share/nginx/html;  # Path to React build files
-                        try_files \$uri /index.html;  # Ensure all routes go to index.html
-                    }
-            
-                    # Forward API requests to backend
-                    location /login {
-                        proxy_pass http://backend:8080;
-                        proxy_set_header Host \$host;
-                        proxy_set_header X-Real-IP \$remote_addr;
-                        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                        proxy_set_header X-Forwarded-Proto \$scheme;
-                    }
-            
-                    location /register {
-                        proxy_pass http://backend:8080;
-                        proxy_set_header Host \$host;
-                        proxy_set_header X-Real-IP \$remote_addr;
-                        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                        proxy_set_header X-Forwarded-Proto \$scheme;
-                    }
-            
-                    location /logout {
-                        proxy_pass http://backend:8080;
-                        proxy_set_header Host \$host;
-                        proxy_set_header X-Real-IP \$remote_addr;
-                        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                        proxy_set_header X-Forwarded-Proto \$scheme;
-                    }
-            
-                    location /game {
-                        proxy_pass http://backend:8080;
-                        proxy_set_header Host \$host;
-                        proxy_set_header X-Real-IP \$remote_addr;
-                        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                        proxy_set_header X-Forwarded-Proto \$scheme;
-                    }
-            
-                    location /search {
-                        proxy_pass http://backend:8080;
-                        proxy_set_header Host \$host;
-                        proxy_set_header X-Real-IP \$remote_addr;
-                        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                        proxy_set_header X-Forwarded-Proto \$scheme;
-                    }
-            
-                    location /favorite {
-                        proxy_pass http://backend:8080;
-                        proxy_set_header Host \$host;
-                        proxy_set_header X-Real-IP \$remote_addr;
-                        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                        proxy_set_header X-Forwarded-Proto \$scheme;
-                    }
-            
-                    location /recommendation {
-                        proxy_pass http://backend:8080;
-                        proxy_set_header Host \$host;
-                        proxy_set_header X-Real-IP \$remote_addr;
-                        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                        proxy_set_header X-Forwarded-Proto \$scheme;
-                    }
-            
-                    # Serve static assets
-                    location /static/ {
-                        root /usr/share/nginx/html;
-                    }
-                }
-            }
-            EOFNGINX
-            
-            # Create custom Dockerfile for the frontend with SSL
-            echo "Creating custom frontend Dockerfile..."
-            cat > Dockerfile.frontend.ssl << EOFDOCK
-            FROM ${{ env.AWS_ECR_URI }}/frontend:latest
-            COPY nginx.conf /etc/nginx/nginx.conf
-            EXPOSE 80 443
-            CMD ["nginx", "-g", "daemon off;"]
-            EOFDOCK
-            
-            # Build custom frontend image with SSL config
-            echo "Building frontend with SSL support..."
-            sudo docker build -t frontend-ssl:latest -f Dockerfile.frontend.ssl .
-            
-            # Create docker-compose.yml with SSL setup
-            echo "Creating docker-compose.yml..."
-            cat > docker-compose.yml << EOFDC
-            version: "3.8"
-            services:
-              backend:
-                image: ${{ env.AWS_ECR_URI }}/backend:latest
-                environment:
-                  SPRING_DATASOURCE_URL: jdbc:mysql://${{ secrets.RDS_ENDPOINT }}/twitch
-                  SPRING_DATASOURCE_USERNAME: ${{ secrets.RDS_USERNAME }}
-                  SPRING_DATASOURCE_PASSWORD: ${{ secrets.RDS_PASSWORD }}
-                  SPRING_PROFILES_ACTIVE: prod
-                ports:
-                  - "8080:8080"
-                networks:
-                  - app-network
-              
-              frontend:
-                image: frontend-ssl:latest
-                volumes:
-                  - /etc/letsencrypt:/etc/letsencrypt:ro
-                ports:
-                  - "80:80"
-                  - "443:443"
-                depends_on:
-                  - backend
-                networks:
-                  - app-network
-            
-            networks:
-              app-network:
-                driver: bridge
-            EOFDC
-            
-            # Setup auto-renewal for the SSL certificate
-            echo "Setting up certificate auto-renewal..."
-            sudo bash -c 'echo "0 0,12 * * * root python3 -c '\''import random; import time; time.sleep(random.random() * 3600)'\'' && certbot renew -q" > /etc/cron.d/certbot-renew'
-            
-            # Start containers
-            echo "Starting containers..."
-            sudo docker-compose up -d
-            
-            # Verify deployment
-            echo "Verifying deployment..."
-            sleep 30
-            echo "Checking frontend health..."
-            curl -k https://localhost/health || echo "Health check failed, but continuing..."
-            echo "Checking backend health..."
-            curl -s http://localhost:8080/actuator/health || echo "Health check failed, but continuing..."
-            
-            echo "Deployment complete!"
-            echo "Your application is now available at:"
-            echo "- HTTP: http://\$EC2_PUBLIC_DNS (redirects to HTTPS)"
-            echo "- HTTPS: https://\$EC2_PUBLIC_DNS"
-          EOF
+          scp -i qa_key.pem deploy_files/nginx.conf ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }}:~/deploy_temp/
+          scp -i qa_key.pem deploy_files/Dockerfile.frontend.ssl ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }}:~/deploy_temp/
+          scp -i qa_key.pem deploy_files/deploy.sh ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }}:~/deploy_temp/
+
+      - name: Run deployment script
+        run: |
+          ssh -i qa_key.pem ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }} "cd deploy_temp && AWS_REGION=${{ env.AWS_REGION }} AWS_ECR_URI=${{ env.AWS_ECR_URI }} RDS_ENDPOINT=${{ secrets.RDS_ENDPOINT }} RDS_USERNAME=${{ secrets.RDS_USERNAME }} RDS_PASSWORD=${{ secrets.RDS_PASSWORD }} ./deploy.sh"
