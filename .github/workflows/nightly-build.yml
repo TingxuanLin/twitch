@@ -405,9 +405,14 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Setup SSH key
+        run: |
+          echo "${{ secrets.EC2_SSH_KEY }}" > qa_key.pem
+          chmod 400 qa_key.pem
+
       - name: Deploy New Images to QA Environment
         run: |
-          ssh -o StrictHostKeyChecking=no -i <(echo "${{ secrets.EC2_SSH_KEY }}") ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }} << EOF
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 -i qa_key.pem ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }} << EOF
             # Login to ECR
             echo "Logging in to ECR..."
             aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.AWS_ECR_URI }}
@@ -419,7 +424,35 @@ jobs:
             
             # Stop running containers
             echo "Stopping current containers..."
-            docker-compose down
+            docker-compose down || true
+            
+            # Create docker-compose.yml with RDS connection
+            cat > docker-compose.yml << 'EOFDC'
+            version: "3.8"
+            services:
+              backend:
+                image: ${{ env.AWS_ECR_URI }}/backend:latest
+                environment:
+                  SPRING_DATASOURCE_URL: jdbc:mysql://${{ secrets.RDS_ENDPOINT }}/twitch
+                  SPRING_DATASOURCE_USERNAME: ${{ secrets.RDS_USERNAME }}
+                  SPRING_DATASOURCE_PASSWORD: ${{ secrets.RDS_PASSWORD }}
+                  SPRING_PROFILES_ACTIVE: prod
+                ports:
+                  - "8080:8080"
+                networks:
+                  - app-network
+              frontend:
+                image: ${{ env.AWS_ECR_URI }}/frontend:latest
+                ports:
+                  - "80:80"
+                depends_on:
+                  - backend
+                networks:
+                  - app-network
+            networks:
+              app-network:
+                driver: bridge
+            EOFDC
             
             # Start containers with new images
             echo "Starting containers with new images..."
@@ -427,7 +460,7 @@ jobs:
             
             # Verify deployment
             echo "Verifying deployment..."
-            sleep 15
+            sleep 30
             echo "Checking frontend health..."
             curl -s http://localhost:80/health
             echo "Checking backend health..."
