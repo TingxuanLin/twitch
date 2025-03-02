@@ -1,7 +1,5 @@
-// src/setupTests.js
-
-// Import Jest DOM extensions
 import "@testing-library/jest-dom";
+import "./__mocks__/antdMocks"; // Import our custom Ant Design mocks
 
 // Mock window.matchMedia
 window.matchMedia = (query) => ({
