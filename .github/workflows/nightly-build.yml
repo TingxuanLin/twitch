@@ -249,8 +249,8 @@ jobs:
 
       - name: Setup SSH key
         run: |
-          echo "${{ secrets.EC2_SSH_KEY }}" > vockey.pem
-          chmod 600 vockey.pem
+          echo "${{ secrets.EC2_SSH_KEY }}" > labsuser.pem
+          chmod 400 labsuser.pem
 
       - name: Start a temporary EC2 instance
         id: start_ec2
@@ -281,7 +281,7 @@ jobs:
 
       - name: SSH into EC2 and run tests
         run: |
-          ssh -o StrictHostKeyChecking=no -i vockey.pem ec2-user@$EC2_PUBLIC_IP << EOF
+          ssh -o StrictHostKeyChecking=no -i labsuser.pem ec2-user@$EC2_PUBLIC_IP << EOF
             # Install Docker and dependencies
             sudo yum install -y docker
             sudo amazon-linux-extras install docker
