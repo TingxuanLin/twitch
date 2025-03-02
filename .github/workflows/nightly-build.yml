@@ -410,7 +410,7 @@ jobs:
           echo "${{ secrets.EC2_SSH_KEY }}" > qa_key.pem
           chmod 400 qa_key.pem
 
-      - name: Deploy New Images to QA Environment
+      - name: Deploy New Images to QA Environment with SSL
         run: |
           ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 -i qa_key.pem ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }} << EOF
             # Login to ECR
@@ -426,7 +426,152 @@ jobs:
             echo "Stopping current containers..."
             docker-compose down || true
             
-            # Create docker-compose.yml with RDS connection
+            # Install Certbot and dependencies
+            echo "Installing Certbot for SSL..."
+            sudo amazon-linux-extras install epel -y
+            sudo yum install certbot -y
+            
+            # Get the EC2 public DNS
+            EC2_PUBLIC_DNS=\$(curl -s http://169.254.169.254/latest/meta-data/public-hostname)
+            echo "EC2 Public DNS: \$EC2_PUBLIC_DNS"
+            
+            # Temporarily stop services on port 80 for certificate validation
+            sudo fuser -k 80/tcp || true
+            
+            # Obtain SSL certificate
+            echo "Obtaining SSL certificate..."
+            sudo certbot certonly --standalone \
+              --non-interactive --agree-tos \
+              --staging \
+              --email tlin52@dons.usfca.edu \
+              -d \$EC2_PUBLIC_DNS
+            
+            # Create nginx.conf with SSL support
+            echo "Creating nginx configuration..."
+            cat > nginx.conf << 'EOFNGINX'
+            events {}
+
+            http {
+                include /etc/nginx/mime.types;
+                default_type application/octet-stream;
+                server_tokens off;
+
+                # Redirect HTTP to HTTPS
+                server {
+                    listen 80;
+                    server_name SERVER_NAME_PLACEHOLDER;
+                    return 301 https://$host$request_uri;
+                }
+
+                # HTTPS server block
+                server {
+                    listen 443 ssl;
+                    server_name SERVER_NAME_PLACEHOLDER;
+                    
+                    # SSL Certificate Configuration
+                    ssl_certificate SSL_CERT_PLACEHOLDER;
+                    ssl_certificate_key SSL_KEY_PLACEHOLDER;
+                    ssl_protocols TLSv1.2 TLSv1.3;
+                    ssl_prefer_server_ciphers on;
+                    
+                    # Serve React frontend
+                    location / {
+                        root /usr/share/nginx/html;  # Path to React build files
+                        try_files $uri /index.html;  # Ensure all routes go to index.html
+                    }
+
+                    # Forward API requests to backend
+                    location /login {
+                        proxy_pass http://backend:8080;
+                        proxy_set_header Host $host;
+                        proxy_set_header X-Real-IP $remote_addr;
+                        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                        proxy_set_header X-Forwarded-Proto $scheme;
+                    }
+
+                    location /register {
+                        proxy_pass http://backend:8080;
+                        proxy_set_header Host $host;
+                        proxy_set_header X-Real-IP $remote_addr;
+                        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                        proxy_set_header X-Forwarded-Proto $scheme;
+                    }
+
+                    location /logout {
+                        proxy_pass http://backend:8080;
+                        proxy_set_header Host $host;
+                        proxy_set_header X-Real-IP $remote_addr;
+                        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                        proxy_set_header X-Forwarded-Proto $scheme;
+                    }
+
+                    location /game {
+                        proxy_pass http://backend:8080;
+                        proxy_set_header Host $host;
+                        proxy_set_header X-Real-IP $remote_addr;
+                        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                        proxy_set_header X-Forwarded-Proto $scheme;
+                    }
+
+                    location /search {
+                        proxy_pass http://backend:8080;
+                        proxy_set_header Host $host;
+                        proxy_set_header X-Real-IP $remote_addr;
+                        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                        proxy_set_header X-Forwarded-Proto $scheme;
+                    }
+
+                    location /favorite {
+                        proxy_pass http://backend:8080;
+                        proxy_set_header Host $host;
+                        proxy_set_header X-Real-IP $remote_addr;
+                        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                        proxy_set_header X-Forwarded-Proto $scheme;
+                    }
+
+                    location /recommendation {
+                        proxy_pass http://backend:8080;
+                        proxy_set_header Host $host;
+                        proxy_set_header X-Real-IP $remote_addr;
+                        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                        proxy_set_header X-Forwarded-Proto $scheme;
+                    }
+
+                    # Serve static assets
+                    location /static/ {
+                        root /usr/share/nginx/html;
+                    }
+                }
+            }
+            EOFNGINX
+            
+            # Replace placeholders with actual values
+            sed -i "s|SERVER_NAME_PLACEHOLDER|\$EC2_PUBLIC_DNS|g" nginx.conf
+            sed -i "s|SSL_CERT_PLACEHOLDER|/etc/letsencrypt/live/\$EC2_PUBLIC_DNS/fullchain.pem|g" nginx.conf
+            sed -i "s|SSL_KEY_PLACEHOLDER|/etc/letsencrypt/live/\$EC2_PUBLIC_DNS/privkey.pem|g" nginx.conf
+            
+            # Create custom Dockerfile for frontend with SSL
+            echo "Creating custom frontend Dockerfile..."
+            cat > Dockerfile.frontend.ssl << 'EOFDOCK'
+            FROM ${{ env.AWS_ECR_URI }}/frontend:latest
+            
+            # Copy our custom nginx.conf
+            COPY ./nginx.conf /etc/nginx/nginx.conf
+            
+            # Create a directory for certbot verification
+            RUN mkdir -p /usr/share/nginx/html/.well-known
+            
+            EXPOSE 80 443
+            
+            CMD ["nginx", "-g", "daemon off;"]
+            EOFDOCK
+            
+            # Build custom frontend image with SSL config
+            echo "Building custom frontend image with SSL support..."
+            docker build -t frontend-ssl:latest -f Dockerfile.frontend.ssl .
+            
+            # Create docker-compose.yml
+            echo "Creating docker-compose.yml..."
             cat > docker-compose.yml << 'EOFDC'
             version: "3.8"
             services:
@@ -437,33 +582,44 @@ jobs:
                   SPRING_DATASOURCE_USERNAME: ${{ secrets.RDS_USERNAME }}
                   SPRING_DATASOURCE_PASSWORD: ${{ secrets.RDS_PASSWORD }}
                   SPRING_PROFILES_ACTIVE: prod
-                ports:
-                  - "8080:8080"
                 networks:
                   - app-network
+              
               frontend:
-                image: ${{ env.AWS_ECR_URI }}/frontend:latest
+                image: frontend-ssl:latest
+                volumes:
+                  - /etc/letsencrypt:/etc/letsencrypt:ro
                 ports:
                   - "80:80"
+                  - "443:443"
                 depends_on:
                   - backend
                 networks:
                   - app-network
+            
             networks:
               app-network:
                 driver: bridge
             EOFDC
             
-            # Start containers with new images
-            echo "Starting containers with new images..."
+            # Setup auto-renewal for the SSL certificate
+            echo "Setting up certificate auto-renewal..."
+            echo "0 0,12 * * * root python -c 'import random; import time; time.sleep(random.random() * 3600)' && certbot renew -q" | sudo tee -a /etc/crontab > /dev/null
+            
+            # Start containers with the new configuration
+            echo "Starting containers..."
             docker-compose up -d
             
             # Verify deployment
             echo "Verifying deployment..."
             sleep 30
-            echo "Checking frontend health..."
-            curl -s http://localhost:80/health
-            echo "Checking backend health..."
-            curl -s http://localhost:8080/actuator/health
+            
+            # Check if services are running
+            echo "Checking services..."
+            docker ps
+            
             echo "Deployment complete!"
+            echo "Your application is now available at:"
+            echo "- HTTP: http://\$EC2_PUBLIC_DNS (redirects to HTTPS)"
+            echo "- HTTPS: https://\$EC2_PUBLIC_DNS"
           EOF
