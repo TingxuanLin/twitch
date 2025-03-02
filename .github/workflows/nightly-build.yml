@@ -1,0 +1,268 @@
+name: Nightly Build
+
+on:
+  schedule:
+    - cron: "0 8 * * *" # This runs the workflow every night at midnight (UTC)
+  workflow_dispatch: # You can also trigger it manually if needed
+
+permissions:
+  id-token: write
+  contents: read
+
+# Global environment variables
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_ECR_URI: ${{ secrets.AWS_ECR_URI }}
+
+# Global defaults
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-test-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v1
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Frontend: Build, Test, and Push
+      - name: Build and Test Frontend
+        run: |
+          # Build the builder stage for testing
+          docker build -t frontend-builder:latest --target builder -f twitchfe/Dockerfile .
+          # Run tests with CI=true to avoid watch mode
+          docker run --rm -e CI=true frontend-builder:latest npm test -- --passWithNoTests
+
+          # Build the complete image for deployment
+          docker build -t frontend-test:latest -f twitchfe/Dockerfile .
+
+      # Backend: Build, Test, and Push
+      - name: Build and Test Backend
+        run: |
+          # Build the builder stage for testing
+          docker build -t backend-builder:latest --target backend-build -f twitchbe/Dockerfile .
+          # Run tests with no-daemon for better CI performance
+          docker run --rm backend-builder:latest gradle test --no-daemon
+
+          # Build the complete image for deployment
+          docker build -t backend-test:latest -f twitchbe/Dockerfile .
+
+      # Push images to ECR if tests pass
+      - name: Push Frontend Image to ECR
+        run: |
+          # Tag with date for versioning
+          TIMESTAMP=$(date +%Y%m%d%H%M)
+          # Push with specific version tag
+          docker tag frontend-test:latest ${{ env.AWS_ECR_URI }}/frontend:$TIMESTAMP
+          docker push ${{ env.AWS_ECR_URI }}/frontend:$TIMESTAMP
+          # Also push as latest
+          docker tag frontend-test:latest ${{ env.AWS_ECR_URI }}/frontend:latest
+          docker push ${{ env.AWS_ECR_URI }}/frontend:latest
+          # Save timestamp for later use
+          echo "FRONTEND_VERSION=$TIMESTAMP" >> $GITHUB_ENV
+
+      - name: Push Backend Image to ECR
+        run: |
+          # Tag with date for versioning
+          TIMESTAMP=$(date +%Y%m%d%H%M)
+          # Push with specific version tag
+          docker tag backend-test:latest ${{ env.AWS_ECR_URI }}/backend:$TIMESTAMP
+          docker push ${{ env.AWS_ECR_URI }}/backend:$TIMESTAMP
+          # Also push as latest
+          docker tag backend-test:latest ${{ env.AWS_ECR_URI }}/backend:latest
+          docker push ${{ env.AWS_ECR_URI }}/backend:latest
+          # Save timestamp for later use
+          echo "BACKEND_VERSION=$TIMESTAMP" >> $GITHUB_ENV
+  integration-test:
+    needs: build-test-push
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup SSH key
+        run: |
+          echo "${{ secrets.EC2_SSH_KEY }}" > vockey.pem
+          chmod 600 vockey.pem
+
+      - name: Start a temporary EC2 instance
+        id: start_ec2
+        run: |
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id ami-0c614dee691cbbf37 \
+            --count 1 \
+            --instance-type t2.micro \
+            --key-name vockey \
+            --security-group-ids sg-0804cb42b13c84e98 \
+            --subnet-id subnet-0d19fbf0bf001c3b2 \
+            --query "Instances[0].InstanceId" \
+            --output text)
+          echo "EC2_INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
+
+      - name: Wait for EC2 to be ready
+        run: |
+          aws ec2 wait instance-status-ok --instance-ids $EC2_INSTANCE_ID
+
+      - name: Get EC2 Public IP
+        id: get_ec2_ip
+        run: |
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --instance-ids $EC2_INSTANCE_ID \
+            --query "Reservations[0].Instances[0].PublicIpAddress" \
+            --output text)
+          echo "EC2_PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+
+      - name: SSH into EC2 and run tests
+        run: |
+          ssh -o StrictHostKeyChecking=no -i vockey.pem ec2-user@$EC2_PUBLIC_IP << EOF
+            # Install Docker and dependencies
+            sudo yum install -y docker
+            sudo amazon-linux-extras install docker
+            sudo systemctl start docker
+            sudo usermod -a -G docker ec2-user
+            
+            # Install docker-compose
+            sudo curl -L "https://github.com/docker/compose/releases/download/v2.20.3/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            sudo chmod +x /usr/local/bin/docker-compose
+            
+            # Login to ECR
+            sudo aws ecr get-login-password --region ${{ env.AWS_REGION }} | sudo docker login --username AWS --password-stdin ${{ env.AWS_ECR_URI }}
+
+            # Pull the latest images from ECR
+            sudo docker pull ${{ env.AWS_ECR_URI }}/frontend:latest
+            sudo docker pull ${{ env.AWS_ECR_URI }}/backend:latest
+
+            # Create docker-compose.yml file
+            cat > docker-compose.yml << 'EOFDC'
+            version: "3.8"
+            services:
+              db:
+                image: mysql:latest
+                environment:
+                  MYSQL_ROOT_HOST: "%"
+                  MYSQL_DATABASE: twitch
+                  MYSQL_ROOT_PASSWORD: secret
+                  TZ: UTC
+                ports:
+                  - "3306:3306"
+                networks:
+                  - app-network
+              backend:
+                image: ${{ env.AWS_ECR_URI }}/backend:latest
+                environment:
+                  SPRING_DATASOURCE_URL: jdbc:mysql://db:3306/twitch
+                  SPRING_DATASOURCE_USERNAME: root
+                  SPRING_DATASOURCE_PASSWORD: secret
+                  SPRING_PROFILES_ACTIVE: prod
+                ports:
+                  - "8080:8080"
+                depends_on:
+                  - db
+                networks:
+                  - app-network
+              frontend:
+                image: ${{ env.AWS_ECR_URI }}/frontend:latest
+                ports:
+                  - "80:80"
+                depends_on:
+                  - backend
+                networks:
+                  - app-network
+            networks:
+              app-network:
+                driver: bridge
+            EOFDC
+            
+            # Start services
+            sudo docker-compose up -d
+            
+            # Wait for services to start
+            echo "Waiting for services to start..."
+            sleep 30
+            
+            # Run integration tests
+            echo "Running integration tests..."
+            curl -v http://localhost:80/health
+            HEALTH_STATUS=$?
+            
+            # Check backend health
+            curl -v http://localhost:8080/actuator/health
+            BACKEND_STATUS=$?
+            
+            # Return overall status
+            if [ $HEALTH_STATUS -eq 0 ] && [ $BACKEND_STATUS -eq 0 ]; then
+              echo "Integration tests passed!"
+              exit 0
+            else
+              echo "Integration tests failed!"
+              exit 1
+            fi
+          EOF
+
+      # Remove the images from ECR if tests fail
+      - name: Remove Images from ECR if Tests Fail
+        if: failure()
+        run: |
+          aws ecr batch-delete-image --repository-name frontend --image-ids imageTag=latest
+          aws ecr batch-delete-image --repository-name backend --image-ids imageTag=latest
+
+      # Terminate EC2 Instance
+      - name: Terminate EC2 Instance
+        if: always()
+        run: |
+          aws ec2 terminate-instances --instance-ids $EC2_INSTANCE_ID
+
+  deploy-qa:
+    needs: integration-test
+    runs-on: ubuntu-latest
+    if: success()
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy New Images to QA Environment
+        run: |
+          ssh -o StrictHostKeyChecking=no -i <(echo "${{ secrets.EC2_SSH_KEY }}") ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }} << EOF
+            # Login to ECR
+            aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.AWS_ECR_URI }}
+            
+            # Pull latest images
+            docker pull ${{ env.AWS_ECR_URI }}/frontend:latest
+            docker pull ${{ env.AWS_ECR_URI }}/backend:latest
+            
+            # Stop running containers
+            docker-compose down
+            
+            # Start containers with new images
+            docker-compose up -d
+            
+            # Verify deployment
+            echo "Verifying deployment..."
+            sleep 15
+            curl -s http://localhost:80/health
+            echo "Deployment complete!"
+          EOF
