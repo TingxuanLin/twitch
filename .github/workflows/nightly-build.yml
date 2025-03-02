@@ -273,6 +273,8 @@ jobs:
       - name: Wait for EC2 to be ready
         run: |
           aws ec2 wait instance-status-ok --instance-ids $EC2_INSTANCE_ID
+          # Add extra time for SSH service to start
+          sleep 60
 
       - name: Get EC2 Public IP
         id: get_ec2_ip
@@ -282,20 +284,47 @@ jobs:
             --query "Reservations[0].Instances[0].PublicIpAddress" \
             --output text)
           echo "EC2_PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+          echo "EC2 Public IP: $PUBLIC_IP"
+
+      - name: Set up SSH config to skip host key checking
+        run: |
+          mkdir -p ~/.ssh
+          echo "Host *
+            StrictHostKeyChecking no
+            UserKnownHostsFile=/dev/null" > ~/.ssh/config
+          chmod 600 ~/.ssh/config
 
       - name: SSH into EC2 and run tests
         run: |
-          ssh -o StrictHostKeyChecking=no -i labsuser.pem ec2-user@$EC2_PUBLIC_IP << EOF
+          # First copy AWS credentials to the EC2 instance
+          scp -i labsuser.pem aws_credentials.txt ec2-user@$EC2_PUBLIC_IP:~/
+
+          ssh -i labsuser.pem ec2-user@$EC2_PUBLIC_IP << EOF
+            # Create AWS credentials directory
+            mkdir -p ~/.aws
+            
+            # Move credentials file to the right location
+            mv ~/aws_credentials.txt ~/.aws/credentials
+            chmod 600 ~/.aws/credentials
+            
+            # Create AWS config file
+            echo "[default]
+            region=${{ env.AWS_REGION }}" > ~/.aws/config
+            
             # Install Docker and dependencies
+            sudo yum update -y
             sudo yum install -y docker
-            sudo amazon-linux-extras install docker
             sudo systemctl start docker
+            sudo systemctl enable docker
             sudo usermod -a -G docker ec2-user
             
             # Install docker-compose
-            sudo curl -L "https://github.com/docker/compose/releases/download/v2.20.3/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            sudo curl -L "https://github.com/docker/compose/releases/download/v2.20.3/docker-compose-\$(uname -s)-\$(uname -m)" -o /usr/local/bin/docker-compose
             sudo chmod +x /usr/local/bin/docker-compose
-
+            
+            # Login to ECR with proper credentials
+            aws ecr get-login-password --region ${{ env.AWS_REGION }} | sudo docker login --username AWS --password-stdin ${{ env.AWS_ECR_URI }}
+            
             # Pull the latest images from ECR
             echo "Pulling frontend image from ECR..."
             sudo docker pull ${{ env.AWS_ECR_URI }}/frontend:latest
@@ -358,19 +387,19 @@ jobs:
             # Test frontend
             echo "Testing frontend health endpoint..."
             FRONTEND_STATUS=0
-            curl -v http://localhost:80/health || FRONTEND_STATUS=$?
+            curl -v http://localhost:80/health || FRONTEND_STATUS=\$?
             
             # Test backend
             echo "Testing backend health endpoint..."
             BACKEND_STATUS=0
-            curl -v http://localhost:8080/actuator/health || BACKEND_STATUS=$?
+            curl -v http://localhost:8080/actuator/health || BACKEND_STATUS=\$?
             
             # Return overall status
-            if [ $FRONTEND_STATUS -eq 0 ] && [ $BACKEND_STATUS -eq 0 ]; then
+            if [ \$FRONTEND_STATUS -eq 0 ] && [ \$BACKEND_STATUS -eq 0 ]; then
               echo "Integration tests passed!"
               exit 0
             else
-              echo "Integration tests failed! Frontend status: $FRONTEND_STATUS, Backend status: $BACKEND_STATUS"
+              echo "Integration tests failed! Frontend status: \$FRONTEND_STATUS, Backend status: \$BACKEND_STATUS"
               # Show logs for debugging
               echo "Container logs:"
               sudo docker-compose logs
