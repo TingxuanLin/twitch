@@ -485,13 +485,23 @@ jobs:
 
       - name: Setup SSH key
         run: |
-          echo "${{ secrets.EC2_SSH_KEY }}" > qa_key.pem
-          chmod 400 qa_key.pem
+          echo "${{ secrets.EC2_SSH_KEY }}" > labsuser.pem
+          chmod 400 labsuser.pem
           mkdir -p ~/.ssh
           echo "Host *
             StrictHostKeyChecking no
             UserKnownHostsFile=/dev/null" > ~/.ssh/config
           chmod 600 ~/.ssh/config
+
+      - name: Verify SSH connection
+        run: |
+          echo "Testing SSH connection to QA instance..."
+          if ssh -i labsuser.pem ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }} "echo Connection successful"; then
+            echo "✅ SSH connection established successfully!"
+          else
+            echo "❌ Connection failed. Please check if GitHub Actions runner can reach the instance."
+            exit 1
+          fi
 
       - name: Create deployment files
         run: |
@@ -511,7 +521,7 @@ jobs:
           aws_session_token=${{ secrets.AWS_SESSION_TOKEN }}
           EOF
 
-          # Create nginx.conf template
+          # Create nginx.conf template with SSL and domain support
           cat > deploy_files/nginx.conf << 'EOF'
           events {}
 
@@ -523,18 +533,26 @@ jobs:
               # Redirect HTTP to HTTPS
               server {
                   listen 80;
-                  server_name SERVER_NAME_PLACEHOLDER;
-                  return 301 https://$host$request_uri;
+                  server_name DOMAIN_NAME_PLACEHOLDER;
+                  
+                  # Let's Encrypt validation
+                  location /.well-known/acme-challenge/ {
+                      root /var/www/certbot;
+                  }
+                  
+                  location / {
+                      return 301 https://$host$request_uri;
+                  }
               }
 
               # HTTPS server block
               server {
                   listen 443 ssl;
-                  server_name SERVER_NAME_PLACEHOLDER;
+                  server_name DOMAIN_NAME_PLACEHOLDER;
                   
                   # SSL Certificate Configuration
-                  ssl_certificate /etc/letsencrypt/live/SERVER_NAME_PLACEHOLDER/fullchain.pem;
-                  ssl_certificate_key /etc/letsencrypt/live/SERVER_NAME_PLACEHOLDER/privkey.pem;
+                  ssl_certificate /etc/letsencrypt/live/DOMAIN_NAME_PLACEHOLDER/fullchain.pem;
+                  ssl_certificate_key /etc/letsencrypt/live/DOMAIN_NAME_PLACEHOLDER/privkey.pem;
                   ssl_protocols TLSv1.2 TLSv1.3;
                   ssl_prefer_server_ciphers on;
                   
@@ -617,10 +635,98 @@ jobs:
           CMD ["nginx", "-g", "daemon off;"]
           EOF
 
-          # Create deployment script
+          # Create Route53 domain setup script
+          cat > deploy_files/setup_route53.sh << 'EOF'
+          #!/bin/bash
+          set -e
+
+          DOMAIN_NAME="$1"
+          PUBLIC_IP="$2"
+
+          if [ -z "$DOMAIN_NAME" ] || [ -z "$PUBLIC_IP" ]; then
+            echo "Usage: $0 <domain_name> <public_ip>"
+            exit 1
+          fi
+
+          echo "Setting up Route53 for domain: $DOMAIN_NAME pointing to $PUBLIC_IP"
+
+          # Check if hosted zone already exists
+          HOSTED_ZONE_ID=$(aws route53 list-hosted-zones-by-name --dns-name "$DOMAIN_NAME" --query "HostedZones[?Name=='$DOMAIN_NAME.'].Id" --output text | sed 's/\/hostedzone\///')
+
+          if [ -z "$HOSTED_ZONE_ID" ]; then
+            echo "Creating new hosted zone for $DOMAIN_NAME"
+            HOSTED_ZONE_ID=$(aws route53 create-hosted-zone \
+              --name "$DOMAIN_NAME" \
+              --caller-reference "$(date +%Y-%m-%d-%H-%M-%S)" \
+              --query "HostedZone.Id" --output text | sed 's/\/hostedzone\///')
+            
+            echo "Created hosted zone: $HOSTED_ZONE_ID"
+            
+            # Get the nameservers for the new hosted zone
+            NAME_SERVERS=$(aws route53 get-hosted-zone --id "$HOSTED_ZONE_ID" \
+              --query "DelegationSet.NameServers" --output text | tr '\t' '\n')
+            
+            echo "===================== IMPORTANT ====================="
+            echo "Please update your domain's nameservers at Name.com to:"
+            echo "$NAME_SERVERS"
+            echo "====================================================="
+            echo "Once you've updated the nameservers, DNS propagation may take up to 48 hours."
+          else
+            echo "Using existing hosted zone: $HOSTED_ZONE_ID"
+          fi
+
+          # Create A records for domain and www subdomain
+          CHANGE_BATCH='{
+            "Changes": [
+              {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                  "Name": "'$DOMAIN_NAME'",
+                  "Type": "A",
+                  "TTL": 300,
+                  "ResourceRecords": [
+                    {
+                      "Value": "'$PUBLIC_IP'"
+                    }
+                  ]
+                }
+              },
+              {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                  "Name": "www.'$DOMAIN_NAME'",
+                  "Type": "A",
+                  "TTL": 300,
+                  "ResourceRecords": [
+                    {
+                      "Value": "'$PUBLIC_IP'"
+                    }
+                  ]
+                }
+              }
+            ]
+          }'
+
+          aws route53 change-resource-record-sets \
+            --hosted-zone-id "$HOSTED_ZONE_ID" \
+            --change-batch "$CHANGE_BATCH"
+
+          echo "Domain setup complete!"
+          echo "Hosted Zone ID: $HOSTED_ZONE_ID"
+          EOF
+          chmod +x deploy_files/setup_route53.sh
+
+          # Create deployment script with Let's Encrypt SSL
           cat > deploy_files/deploy.sh << 'EOF'
           #!/bin/bash
           set -e
+
+          # Get the domain from environment variable
+          DOMAIN_NAME="$DOMAIN_NAME"
+          if [ -z "$DOMAIN_NAME" ]; then
+            echo "ERROR: DOMAIN_NAME environment variable not set"
+            exit 1
+          fi
 
           # Install Docker if not already installed
           if ! command -v docker &> /dev/null; then
@@ -644,16 +750,6 @@ jobs:
             echo "Docker Compose is already installed"
           fi
 
-          # Install Certbot
-          echo "Installing Certbot..."
-          sudo dnf install -y certbot
-
-          # Get instance public DNS and IP
-          EC2_PUBLIC_DNS=$(curl -s http://169.254.169.254/latest/meta-data/public-hostname)
-          EC2_PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
-          echo "Public DNS: $EC2_PUBLIC_DNS"
-          echo "Public IP: $EC2_PUBLIC_IP"
-
           # Login to ECR
           echo "Logging in to ECR..."
           aws ecr get-login-password --region $AWS_REGION | sudo docker login --username AWS --password-stdin $AWS_ECR_URI
@@ -667,39 +763,23 @@ jobs:
           echo "Stopping current containers..."
           sudo docker-compose down || true
 
-          # Stop any services using port 80 or 443
-          sudo fuser -k 80/tcp || true
-          sudo fuser -k 443/tcp || true
+          # Create directories for Let's Encrypt
+          echo "Setting up Let's Encrypt directories..."
+          sudo mkdir -p /var/www/certbot
+          sudo mkdir -p /etc/letsencrypt
 
-          # Obtain SSL certificate
-          echo "Obtaining SSL certificate..."
-          sudo certbot certonly --standalone \
-            --non-interactive --agree-tos \
-            --staging \
-            --email your-email@example.com \
-            -d $EC2_PUBLIC_DNS
-
-          if [ ! -d "/etc/letsencrypt/live/$EC2_PUBLIC_DNS" ]; then
-            echo "Creating self-signed certificate..."
-            sudo mkdir -p /etc/letsencrypt/live/$EC2_PUBLIC_DNS
-            sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-              -keyout /etc/letsencrypt/live/$EC2_PUBLIC_DNS/privkey.pem \
-              -out /etc/letsencrypt/live/$EC2_PUBLIC_DNS/fullchain.pem \
-              -subj "/CN=$EC2_PUBLIC_DNS"
-          fi
-
-          # Update nginx.conf with actual server name
-          echo "Configuring nginx..."
-          sed -i "s|SERVER_NAME_PLACEHOLDER|$EC2_PUBLIC_DNS|g" nginx.conf
+          # Update nginx.conf with actual domain name
+          echo "Configuring nginx with domain: $DOMAIN_NAME"
+          sed -i "s|DOMAIN_NAME_PLACEHOLDER|$DOMAIN_NAME|g" nginx.conf
 
           # Update Dockerfile with actual frontend image
           sed -i "s|FRONTEND_IMAGE_PLACEHOLDER|$AWS_ECR_URI/frontend:latest|g" Dockerfile.frontend.ssl
 
           # Build custom frontend image
-          echo "Building frontend with SSL..."
+          echo "Building frontend with SSL support..."
           sudo docker build -t frontend-ssl:latest -f Dockerfile.frontend.ssl .
 
-          # Create docker-compose.yml
+          # Create docker-compose.yml with certbot
           echo "Creating docker-compose.yml..."
           cat > docker-compose.yml << EOFYML
           version: "3.8"
@@ -720,6 +800,7 @@ jobs:
               image: frontend-ssl:latest
               volumes:
                 - /etc/letsencrypt:/etc/letsencrypt:ro
+                - /var/www/certbot:/var/www/certbot:ro
               ports:
                 - "80:80"
                 - "443:443"
@@ -727,72 +808,68 @@ jobs:
                 - backend
               networks:
                 - app-network
+            
+            certbot:
+              image: certbot/certbot
+              volumes:
+                - /etc/letsencrypt:/etc/letsencrypt
+                - /var/www/certbot:/var/www/certbot
+              entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait \$\${!}; done;'"
 
           networks:
             app-network:
               driver: bridge
           EOFYML
 
-          # Setup certificate renewal
-          echo "Setting up certificate renewal..."
-          sudo bash -c 'echo "0 0,12 * * * root python3 -c '\''import random; import time; time.sleep(random.random() * 3600)'\'' && certbot renew -q" > /etc/cron.d/certbot-renew'
-
-          # Start containers
-          echo "Starting containers..."
+          # Start the containers (first run without SSL for ACME challenge)
+          echo "Starting containers for initial ACME challenge..."
           sudo docker-compose up -d
 
-          # Wait for services to start
-          echo "Waiting for services to start..."
-          sleep 30
+          # Wait briefly for services to start
+          sleep 10
 
-          # Check services
-          echo "Checking service health..."
-          curl -k https://localhost/health || echo "Frontend health check failed, but continuing..."
-          curl -s http://localhost:8080/actuator/health || echo "Backend health check failed, but continuing..."
+          # Obtain Let's Encrypt certificate
+          echo "Obtaining Let's Encrypt SSL certificate for $DOMAIN_NAME..."
+          sudo docker run --rm -v /etc/letsencrypt:/etc/letsencrypt -v /var/www/certbot:/var/www/certbot \
+            certbot/certbot certonly --webroot -w /var/www/certbot \
+            --email admin@$DOMAIN_NAME --agree-tos --no-eff-email \
+            -d $DOMAIN_NAME -d www.$DOMAIN_NAME --force-renewal
+
+          # Restart containers with SSL support
+          echo "Restarting containers with SSL support..."
+          sudo docker-compose down
+          sudo docker-compose up -d
+
+          # Setup auto-renewal cron job
+          echo "Setting up certificate auto-renewal..."
+          sudo bash -c 'echo "0 0,12 * * * root docker run --rm -v /etc/letsencrypt:/etc/letsencrypt -v /var/www/certbot:/var/www/certbot certbot/certbot renew --quiet" > /etc/cron.d/certbot-renew'
 
           echo "Deployment complete!"
-          echo "Your application is available at:"
-          echo "- HTTP: http://$EC2_PUBLIC_DNS (redirects to HTTPS)"
-          echo "- HTTPS: https://$EC2_PUBLIC_DNS"
+          echo "Your application is now available at:"
+          echo "- HTTP: http://$DOMAIN_NAME (redirects to HTTPS)"
+          echo "- HTTPS: https://$DOMAIN_NAME"
           EOF
-
           chmod +x deploy_files/deploy.sh
 
-      - name: Check QA instance availability
+      - name: Copy deployment files to EC2 instance
         run: |
-          # Test connection
-          for i in {1..5}; do
-            if ping -c 1 ${{ secrets.EC2_QA_PUBLIC_IP }} > /dev/null 2>&1; then
-              echo "QA instance is reachable"
-              break
-            else
-              echo "QA instance not reachable. Retrying in 10 seconds... (Attempt $i of 5)"
-              sleep 10
-            fi
-          done
+          ssh -i labsuser.pem ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }} "mkdir -p ~/.aws deploy_temp"
 
-          # Test SSH connection
-          for i in {1..5}; do
-            if ssh -i qa_key.pem ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }} "echo SSH connection successful"; then
-              echo "SSH connection established!"
-              break
-            else
-              echo "SSH connection failed. Retrying in 10 seconds... (Attempt $i of 5)"
-              sleep 10
-            fi
-          done
+          # Copy AWS credentials
+          scp -i labsuser.pem deploy_files/config ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }}:~/.aws/config
+          scp -i labsuser.pem deploy_files/credentials ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }}:~/.aws/credentials
+          ssh -i labsuser.pem ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }} "chmod 600 ~/.aws/credentials"
 
-      - name: Copy deployment files
+          # Copy deployment files
+          scp -i labsuser.pem deploy_files/nginx.conf ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }}:~/deploy_temp/
+          scp -i labsuser.pem deploy_files/Dockerfile.frontend.ssl ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }}:~/deploy_temp/
+          scp -i labsuser.pem deploy_files/setup_route53.sh ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }}:~/deploy_temp/
+          scp -i labsuser.pem deploy_files/deploy.sh ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }}:~/deploy_temp/
+
+      - name: Setup domain in Route53
         run: |
-          ssh -i qa_key.pem ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }} "mkdir -p ~/.aws deploy_temp"
-          scp -i qa_key.pem deploy_files/config ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }}:~/.aws/config
-          scp -i qa_key.pem deploy_files/credentials ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }}:~/.aws/credentials
-          ssh -i qa_key.pem ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }} "chmod 600 ~/.aws/credentials"
+          ssh -i labsuser.pem ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }} "cd deploy_temp && ./setup_route53.sh ${{ secrets.DOMAIN_NAME }} ${{ secrets.EC2_QA_PUBLIC_IP }}"
 
-          scp -i qa_key.pem deploy_files/nginx.conf ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }}:~/deploy_temp/
-          scp -i qa_key.pem deploy_files/Dockerfile.frontend.ssl ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }}:~/deploy_temp/
-          scp -i qa_key.pem deploy_files/deploy.sh ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }}:~/deploy_temp/
-
-      - name: Run deployment script
+      - name: Deploy application with SSL
         run: |
-          ssh -i qa_key.pem ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }} "cd deploy_temp && AWS_REGION=${{ env.AWS_REGION }} AWS_ECR_URI=${{ env.AWS_ECR_URI }} RDS_ENDPOINT=${{ secrets.RDS_ENDPOINT }} RDS_USERNAME=${{ secrets.RDS_USERNAME }} RDS_PASSWORD=${{ secrets.RDS_PASSWORD }} ./deploy.sh"
+          ssh -i labsuser.pem ec2-user@${{ secrets.EC2_QA_PUBLIC_IP }} "cd deploy_temp && AWS_REGION=${{ env.AWS_REGION }} AWS_ECR_URI=${{ env.AWS_ECR_URI }} RDS_ENDPOINT=${{ secrets.RDS_ENDPOINT }} RDS_USERNAME=${{ secrets.RDS_USERNAME }} RDS_PASSWORD=${{ secrets.RDS_PASSWORD }} DOMAIN_NAME=${{ secrets.DOMAIN_NAME }} ./deploy.sh"
