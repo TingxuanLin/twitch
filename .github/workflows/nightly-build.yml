@@ -649,6 +649,15 @@ jobs:
           echo "${{ secrets.EC2_SSH_KEY }}" > labsuser.pem
           chmod 400 labsuser.pem
 
+      - name: Check network connectivity
+        run: |
+          # Test basic connectivity
+          echo "Testing basic network connectivity..."
+          ping -c 3 ${{ secrets.EC2_QA_PUBLIC_IP }} || echo "Ping failed, but this might be expected"
+
+          # Use telnet to check specific port
+          timeout 5 bash -c "</dev/tcp/${{ secrets.EC2_QA_PUBLIC_IP }}/22" && echo "Port 22 is open" || echo "Port 22 is closed"
+
       - name: Attempt SSH connection with retries
         run: |
           echo "Attempting SSH connection to QA instance..."
