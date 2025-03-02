@@ -332,12 +332,19 @@ jobs:
                 TZ: UTC
               ports:
                 - "3306:3306"
+              healthcheck:
+                test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-psecret"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
               networks:
                 - app-network
+              command: --default-authentication-plugin=mysql_native_password
+
             backend:
               image: ${{ env.AWS_ECR_URI }}/backend:latest
               environment:
-                SPRING_DATASOURCE_URL: jdbc:mysql://db:3306/twitch
+                SPRING_DATASOURCE_URL: jdbc:mysql://db:3306/twitch?createDatabaseIfNotExist=true&allowPublicKeyRetrieval=true&useSSL=false
                 SPRING_DATASOURCE_USERNAME: root
                 SPRING_DATASOURCE_PASSWORD: secret
                 SPRING_PROFILES_ACTIVE: prod
