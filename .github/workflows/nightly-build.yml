@@ -288,17 +288,8 @@ jobs:
 
       - name: Install Docker on EC2
         run: |
-          ssh -i labsuser.pem ec2-user@$EC2_PUBLIC_IP << EOF
-            sudo yum update -y
-            sudo yum install -y docker
-            sudo systemctl start docker
-            sudo systemctl enable docker
-            sudo usermod -a -G docker ec2-user
-            
-            # Install docker-compose
-            sudo curl -L "https://github.com/docker/compose/releases/download/v2.20.3/docker-compose-\$(uname -s)-\$(uname -m)" -o /usr/local/bin/docker-compose
-            sudo chmod +x /usr/local/bin/docker-compose
-          EOF
+          ssh -i labsuser.pem ec2-user@$EC2_PUBLIC_IP "sudo yum update -y && sudo yum install -y docker && sudo systemctl start docker && sudo systemctl enable docker && sudo usermod -a -G docker ec2-user"
+          ssh -i labsuser.pem ec2-user@$EC2_PUBLIC_IP "sudo curl -L \"https://github.com/docker/compose/releases/download/v2.20.3/docker-compose-\$(uname -s)-\$(uname -m)\" -o /usr/local/bin/docker-compose && sudo chmod +x /usr/local/bin/docker-compose"
 
       - name: Copy AWS credentials to EC2
         run: |
@@ -318,70 +309,62 @@ jobs:
           ssh -i labsuser.pem ec2-user@$EC2_PUBLIC_IP "chmod 600 ~/.aws/credentials"
           rm credentials config
 
-      - name: Verify AWS credentials on EC2
+      - name: Login to ECR
         run: |
-          ssh -i labsuser.pem ec2-user@$EC2_PUBLIC_IP "aws sts get-caller-identity"
+          ssh -i labsuser.pem ec2-user@$EC2_PUBLIC_IP "aws ecr get-login-password --region ${{ env.AWS_REGION }} | sudo docker login --username AWS --password-stdin ${{ env.AWS_ECR_URI }}"
 
-      - name: Login to ECR and run tests
+      - name: Pull Docker images
         run: |
-          ssh -i labsuser.pem ec2-user@$EC2_PUBLIC_IP << EOF
-            # Login to ECR
-            AWS_ECR_URI="${{ env.AWS_ECR_URI }}"
-            echo "ECR URI: \$AWS_ECR_URI"
-            
-            aws ecr get-login-password --region ${{ env.AWS_REGION }} | sudo docker login --username AWS --password-stdin \$AWS_ECR_URI
-            
-            # Pull images
-            echo "Pulling frontend image..."
-            sudo docker pull \$AWS_ECR_URI/frontend:latest
-            
-            echo "Pulling backend image..."
-            sudo docker pull \$AWS_ECR_URI/backend:latest
-            
-            # Create docker-compose.yml
-            cat > docker-compose.yml << 'EOD'
-            version: "3.8"
-            services:
-              db:
-                image: mysql:latest
-                environment:
-                  MYSQL_ROOT_HOST: "%"
-                  MYSQL_DATABASE: twitch
-                  MYSQL_ROOT_PASSWORD: secret
-                  TZ: UTC
-                ports:
-                  - "3306:3306"
-                networks:
-                  - app-network
-              backend:
-                image: AWS_ECR_URI_PLACEHOLDER/backend:latest
-                environment:
-                  SPRING_DATASOURCE_URL: jdbc:mysql://db:3306/twitch
-                  SPRING_DATASOURCE_USERNAME: root
-                  SPRING_DATASOURCE_PASSWORD: secret
-                  SPRING_PROFILES_ACTIVE: prod
-                ports:
-                  - "8080:8080"
-                depends_on:
-                  - db
-                networks:
-                  - app-network
-              frontend:
-                image: AWS_ECR_URI_PLACEHOLDER/frontend:latest
-                ports:
-                  - "80:80"
-                depends_on:
-                  - backend
-                networks:
-                  - app-network
-            networks:
-              app-network:
-                driver: bridge
-            EOD
-            
-            # Replace placeholder with actual ECR URI
-            sed -i "s|AWS_ECR_URI_PLACEHOLDER|\$AWS_ECR_URI|g" docker-compose.yml
-            
+          ssh -i labsuser.pem ec2-user@$EC2_PUBLIC_IP "sudo docker pull ${{ env.AWS_ECR_URI }}/frontend:latest"
+          ssh -i labsuser.pem ec2-user@$EC2_PUBLIC_IP "sudo docker pull ${{ env.AWS_ECR_URI }}/backend:latest"
+
+      - name: Create docker-compose.yml
+        run: |
+          cat > docker-compose.yml << EOF
+          version: "3.8"
+          services:
+            db:
+              image: mysql:latest
+              environment:
+                MYSQL_ROOT_HOST: "%"
+                MYSQL_DATABASE: twitch
+                MYSQL_ROOT_PASSWORD: secret
+                TZ: UTC
+              ports:
+                - "3306:3306"
+              networks:
+                - app-network
+            backend:
+              image: ${{ env.AWS_ECR_URI }}/backend:latest
+              environment:
+                SPRING_DATASOURCE_URL: jdbc:mysql://db:3306/twitch
+                SPRING_DATASOURCE_USERNAME: root
+                SPRING_DATASOURCE_PASSWORD: secret
+                SPRING_PROFILES_ACTIVE: prod
+              ports:
+                - "8080:8080"
+              depends_on:
+                - db
+              networks:
+                - app-network
+            frontend:
+              image: ${{ env.AWS_ECR_URI }}/frontend:latest
+              ports:
+                - "80:80"
+              depends_on:
+                - backend
+              networks:
+                - app-network
+          networks:
+            app-network:
+              driver: bridge
+          EOF
+
+          scp -i labsuser.pem docker-compose.yml ec2-user@$EC2_PUBLIC_IP:~/docker-compose.yml
+
+      - name: Run integration tests
+        run: |
+          ssh -i labsuser.pem ec2-user@$EC2_PUBLIC_IP << 'EOF'
             # Start containers
             echo "Starting containers..."
             sudo docker-compose up -d
@@ -394,29 +377,31 @@ jobs:
             echo "Checking container status:"
             sudo docker ps -a
             
-            # Check container logs
-            echo "Container logs:"
-            sudo docker-compose logs
-            
             # Run integration tests
             echo "Running integration tests..."
             
             # Test frontend
             echo "Testing frontend health endpoint..."
             FRONTEND_STATUS=0
-            curl -v http://localhost:80/health || FRONTEND_STATUS=\$?
+            curl -v http://localhost:80/health || FRONTEND_STATUS=$?
             
             # Test backend
             echo "Testing backend health endpoint..."
             BACKEND_STATUS=0
-            curl -v http://localhost:8080/actuator/health || BACKEND_STATUS=\$?
+            curl -v http://localhost:8080/actuator/health || BACKEND_STATUS=$?
+            
+            # Check container logs if tests failed
+            if [ $FRONTEND_STATUS -ne 0 ] || [ $BACKEND_STATUS -ne 0 ]; then
+              echo "Tests failed - showing container logs:"
+              sudo docker-compose logs
+            fi
             
             # Return overall status
-            if [ \$FRONTEND_STATUS -eq 0 ] && [ \$BACKEND_STATUS -eq 0 ]; then
+            if [ $FRONTEND_STATUS -eq 0 ] && [ $BACKEND_STATUS -eq 0 ]; then
               echo "Integration tests passed!"
               exit 0
             else
-              echo "Integration tests failed! Frontend status: \$FRONTEND_STATUS, Backend status: \$BACKEND_STATUS"
+              echo "Integration tests failed! Frontend status: $FRONTEND_STATUS, Backend status: $BACKEND_STATUS"
               exit 1
             fi
           EOF
