@@ -261,12 +261,12 @@ jobs:
         id: start_ec2
         run: |
           INSTANCE_ID=$(aws ec2 run-instances \
-            --image-id ami-0c614dee691cbbf37 \
+            --image-id ami-05b10e08d247fb927 \
             --count 1 \
             --instance-type t2.micro \
             --key-name vockey \
             --security-group-ids sg-01d9849f009a95731 \
-            --subnet-id subnet-0d19fbf0bf001c3b2 \
+            --subnet-id subnet-04e9c032770aedb13 \
             --query "Instances[0].InstanceId" \
             --output text)
           echo "EC2_INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
