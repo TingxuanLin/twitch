@@ -532,8 +532,8 @@ jobs:
           sudo chmod +x /usr/local/bin/docker-compose
 
           # Login to ECR
-          echo "Logging in to Amazon ECR..."
-          aws ecr get-login-password --region $AWS_REGION | sudo docker login --username AWS --password-stdin $ECR_URI
+          # echo "Logging in to Amazon ECR..."
+          # aws ecr get-login-password --region $AWS_REGION | sudo docker login --username AWS --password-stdin $ECR_URI
 
           # Create application directory
           mkdir -p ~/mytwitch-app
