@@ -678,39 +678,6 @@ jobs:
           echo "Deploying application with SSL..."
           ssh -i labsuser.pem -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ec2-user@$EC2_IP "ECR_URI=${{ env.AWS_ECR_URI }} RDS_ENDPOINT=${{ secrets.RDS_ENDPOINT }} RDS_USERNAME=${{ secrets.RDS_USERNAME }} RDS_PASSWORD=${{ secrets.RDS_PASSWORD }} EC2_PUBLIC_IP=$EC2_IP ./deploy.sh mytwitch.software"
 
-      - name: Check security group settings
-        if: ${{ env.SSH_CONNECTION_SUCCESS == 'true' }}
-        run: |
-          EC2_IP="${{ secrets.EC2_QA_PUBLIC_IP }}"
-
-          echo "Checking EC2 security group for RDS access..."
-          # Get instance ID from IP
-          EC2_INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=public-ip-address,Values=$EC2_IP" --query "Reservations[0].Instances[0].InstanceId" --output text)
-          echo "EC2 Instance ID: $EC2_INSTANCE_ID"
-
-          # Get security groups
-          SG_IDS=$(aws ec2 describe-instances --instance-ids $EC2_INSTANCE_ID --query "Reservations[0].Instances[0].SecurityGroups[*].GroupId" --output text)
-          echo "Security Groups: $SG_IDS"
-
-          for SG_ID in $SG_IDS; do
-            echo "Checking outbound rules for Security Group: $SG_ID"
-            aws ec2 describe-security-groups --group-ids $SG_ID --query "SecurityGroups[0].IpPermissionsEgress" --output table
-          done
-
-          # Check RDS security group
-          echo "Checking RDS security group settings..."
-          RDS_ENDPOINT="${{ secrets.RDS_ENDPOINT }}"
-          RDS_IDENTIFIER=$(echo $RDS_ENDPOINT | cut -d'.' -f1)
-          echo "RDS Identifier: $RDS_IDENTIFIER"
-
-          RDS_SG_IDS=$(aws rds describe-db-instances --db-instance-identifier $RDS_IDENTIFIER --query "DBInstances[0].VpcSecurityGroups[*].VpcSecurityGroupId" --output text 2>/dev/null || echo "Unable to determine RDS security groups")
-          echo "RDS Security Groups: $RDS_SG_IDS"
-
-          for SG_ID in $RDS_SG_IDS; do
-            echo "Checking inbound rules for RDS Security Group: $SG_ID"
-            aws ec2 describe-security-groups --group-ids $SG_ID --query "SecurityGroups[0].IpPermissions" --output table
-          done
-
       - name: Verify deployment
         if: ${{ env.SSH_CONNECTION_SUCCESS == 'true' }}
         run: |
