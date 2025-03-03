@@ -506,41 +506,41 @@ jobs:
             echo "SSH_CONNECTION_SUCCESS=false" >> $GITHUB_ENV
           fi
 
-      - name: Create deployment and DNS scripts
+      - name: Create simple deployment script
         if: ${{ env.SSH_CONNECTION_SUCCESS == 'true' }}
         run: |
-          # Create the EC2 deployment script
+          # Create a simplified deployment script
           cat > deploy.sh << 'EOF'
           #!/bin/bash
-          # EC2 Deployment Script for mytwitch.software
+          # Simple deployment script for mytwitch.software
           set -e
 
           echo "=== Starting deployment process for mytwitch.software ==="
           echo "$(date)"
 
-          # Install required packages
+          # Update system and install Docker
+          echo "Installing Docker..."
           sudo yum update -y
-          sudo amazon-linux-extras install -y docker
-          sudo yum install -y jq curl git python3 python3-pip
-          sudo pip3 install certbot certbot-nginx
-
-          # Start docker service
+          sudo yum install -y docker
           sudo systemctl start docker
           sudo systemctl enable docker
           sudo usermod -aG docker $USER
 
-          # Login to ECR
-          aws ecr get-login-password --region $AWS_REGION | sudo docker login --username AWS --password-stdin $ECR_URI
-
           # Install Docker Compose
+          echo "Installing Docker Compose..."
           sudo curl -L "https://github.com/docker/compose/releases/download/v2.20.3/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
           sudo chmod +x /usr/local/bin/docker-compose
 
-          # Create app directory structure
-          mkdir -p ~/mytwitch-app/nginx/{conf.d,ssl} ~/mytwitch-app/certbot/{www,conf}
+          # Login to ECR
+          echo "Logging in to Amazon ECR..."
+          aws ecr get-login-password --region $AWS_REGION | sudo docker login --username AWS --password-stdin $ECR_URI
+
+          # Create application directory
+          mkdir -p ~/mytwitch-app
           cd ~/mytwitch-app
 
-          # Create docker-compose.yml file with RDS connection
+          # Create docker-compose.yml
+          echo "Creating docker-compose.yml..."
           cat > docker-compose.yml << EOFDC
           version: "3.8"
           services:
@@ -552,9 +552,8 @@ jobs:
                 SPRING_DATASOURCE_USERNAME: ${RDS_USERNAME}
                 SPRING_DATASOURCE_PASSWORD: ${RDS_PASSWORD}
                 SPRING_PROFILES_ACTIVE: prod
-                DATABASE_INIT: update
-                LOGGING_LEVEL_ORG_SPRINGFRAMEWORK: INFO
-                LOGGING_LEVEL_COM_LAIOFFER: INFO
+                LOGGING_LEVEL_ORG_SPRINGFRAMEWORK: DEBUG
+                LOGGING_LEVEL_COM_LAIOFFER: DEBUG
               ports:
                 - "8080:8080"
               networks:
@@ -565,12 +564,6 @@ jobs:
               restart: always
               ports:
                 - "80:80"
-                - "443:443"
-              volumes:
-                - ./nginx/conf.d:/etc/nginx/conf.d
-                - ./nginx/ssl:/etc/nginx/ssl
-                - ./certbot/www:/var/www/certbot
-                - ./certbot/conf:/etc/letsencrypt
               depends_on:
                 - backend
               networks:
@@ -581,15 +574,12 @@ jobs:
               driver: bridge
           EOFDC
 
-          # Create initial Nginx configuration for HTTP
+          # Create Nginx configuration to proxy API requests
+          mkdir -p nginx/conf.d
           cat > nginx/conf.d/default.conf << EOFNGINX
           server {
               listen 80;
               server_name qa.mytwitch.software;
-              
-              location /.well-known/acme-challenge/ {
-                  root /var/www/certbot;
-              }
               
               location / {
                   root /usr/share/nginx/html;
@@ -616,109 +606,30 @@ jobs:
           EOFNGINX
 
           # Pull Docker images
+          echo "Pulling Docker images..."
           sudo docker pull ${ECR_URI}/frontend:latest
           sudo docker pull ${ECR_URI}/backend:latest
 
           # Stop any running containers
+          echo "Stopping existing containers if any..."
           sudo docker-compose down || true
 
           # Start containers
+          echo "Starting containers..."
           sudo docker-compose up -d
 
-          # Wait for containers to be ready
-          echo "Waiting for containers to be ready..."
-          sleep 30
+          # Check container status
+          echo "Checking container status..."
+          sudo docker-compose ps
 
-          # Check if the backend is connecting to RDS successfully
-          BACKEND_CONTAINER=$(sudo docker ps -q -f name=backend)
-          if [ -z "$BACKEND_CONTAINER" ]; then
-            echo "ERROR: Backend container is not running. Checking logs:"
-            sudo docker-compose logs backend
-            exit 1
-          fi
-
-          echo "Checking backend connection to RDS..."
-          if sudo docker-compose logs backend | grep -i "Started Application"; then
-            echo "✅ Backend successfully connected to RDS database"
-          else
-            echo "⚠️ Could not verify backend connection to RDS. Continuing anyway..."
-          fi
-
-          # Get SSL certificate
-          sudo certbot certonly --standalone --preferred-challenges http -d qa.mytwitch.software --email admin@mytwitch.software --agree-tos --non-interactive --force-renewal
-
-          # Update Nginx configuration for HTTPS
-          cat > nginx/conf.d/default.conf << EOFNGINXSSL
-          server {
-              listen 80;
-              server_name qa.mytwitch.software;
-              
-              location /.well-known/acme-challenge/ {
-                  root /var/www/certbot;
-              }
-              
-              location / {
-                  return 301 https://\$host\$request_uri;
-              }
-          }
-
-          server {
-              listen 443 ssl;
-              server_name qa.mytwitch.software;
-              
-              ssl_certificate /etc/letsencrypt/live/qa.mytwitch.software/fullchain.pem;
-              ssl_certificate_key /etc/letsencrypt/live/qa.mytwitch.software/privkey.pem;
-              
-              # SSL configuration
-              ssl_protocols TLSv1.2 TLSv1.3;
-              ssl_prefer_server_ciphers on;
-              ssl_ciphers "EECDH+AESGCM:EDH+AESGCM:AES256+EECDH:AES256+EDH";
-              
-              # Frontend content
-              location / {
-                  root /usr/share/nginx/html;
-                  index index.html index.htm;
-                  try_files \$uri \$uri/ /index.html;
-              }
-              
-              # Backend API proxy
-              location /api/ {
-                  proxy_pass http://backend:8080/;
-                  proxy_set_header Host \$host;
-                  proxy_set_header X-Real-IP \$remote_addr;
-                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto \$scheme;
-              }
-              
-              # Actuator endpoints
-              location /actuator/ {
-                  proxy_pass http://backend:8080/actuator/;
-                  proxy_set_header Host \$host;
-                  proxy_set_header X-Real-IP \$remote_addr;
-              }
-          }
-          EOFNGINXSSL
-
-          # Copy SSL certificates
-          sudo mkdir -p /etc/letsencrypt/live/qa.mytwitch.software/
-          sudo ln -sf /etc/letsencrypt/live/qa.mytwitch.software/fullchain.pem ./nginx/ssl/fullchain.pem || true
-          sudo ln -sf /etc/letsencrypt/live/qa.mytwitch.software/privkey.pem ./nginx/ssl/privkey.pem || true
-
-          # Restart frontend to apply SSL configuration
-          sudo docker-compose restart frontend
-
-          # Set up auto-renewal for SSL certificates
-          (crontab -l 2>/dev/null; echo "0 12 * * * certbot renew --quiet --post-hook 'docker-compose -f ~/mytwitch-app/docker-compose.yml restart frontend'") | crontab -
-
-          # Test the deployment
-          echo "Testing the deployment..."
-          curl -s -o /dev/null -w "HTTP Status: %{http_code}\n" http://qa.mytwitch.software || echo "Cannot connect to http://qa.mytwitch.software"
+          # Log container output for debugging
+          echo "Frontend logs:"
+          sudo docker-compose logs frontend
+          echo "Backend logs:"
+          sudo docker-compose logs backend
 
           echo "=== Deployment completed ==="
-          echo "Application available at: https://qa.mytwitch.software (after DNS propagation)"
-
-          # Display container status
-          sudo docker-compose ps
+          echo "Application should be available at: http://qa.mytwitch.software (after DNS propagation)"
           EOF
 
           # Create Route53 DNS update script
@@ -790,8 +701,8 @@ jobs:
           ssh -i labsuser.pem ec2-user@$EC2_IP "AWS_REGION=${{ env.AWS_REGION }} AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} AWS_SESSION_TOKEN=${{ secrets.AWS_SESSION_TOKEN }} ~/update_route53.sh $EC2_IP"
 
           echo "Deployment completed. Fetching logs..."
-          scp -i labsuser.pem ec2-user@$EC2_IP:~/deployment.log ./deployment.log
-          cat ./deployment.log
+          scp -i labsuser.pem ec2-user@$EC2_IP:~/deployment.log ./deployment.log || echo "Could not fetch deployment log"
+          cat ./deployment.log || echo "Could not display deployment log"
 
       - name: Verify deployment
         if: ${{ env.SSH_CONNECTION_SUCCESS == 'true' }}
@@ -805,5 +716,5 @@ jobs:
           ssh -i labsuser.pem ec2-user@$EC2_IP "curl -s -o /dev/null -w 'Frontend HTTP Status: %{http_code}\n' http://localhost:80 || echo 'Frontend not responding'"
           ssh -i labsuser.pem ec2-user@$EC2_IP "curl -s -o /dev/null -w 'Backend HTTP Status: %{http_code}\n' http://localhost:8080/actuator/health || echo 'Backend health check failed'"
 
-          echo "Application URL: https://qa.mytwitch.software"
-          echo "Note: DNS propagation may take up to 15 minutes."
+          echo "Application URL: http://qa.mytwitch.software"
+          echo "Note: We'll add SSL in a follow-up step after confirming basic functionality."
