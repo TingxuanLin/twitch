@@ -265,7 +265,7 @@ jobs:
             --count 1 \
             --instance-type t2.micro \
             --key-name vockey \
-            --security-group-ids sg-01d9849f009a95731 \
+            --security-group-ids sg-07a5106991a444a5b \
             --subnet-id subnet-04e9c032770aedb13 \
             --query "Instances[0].InstanceId" \
             --output text)
