@@ -517,7 +517,7 @@ jobs:
           # Install tools for troubleshooting
           if ! command -v jq &> /dev/null; then
             echo "Installing jq and other tools..."
-            sudo dnf install -y jq bind-utils
+            sudo dnf install -y jq bind-utils mysql
           fi
 
           # Setup AWS CLI
@@ -542,9 +542,314 @@ jobs:
           EOF
           chmod +x scripts/setup_ec2.sh
 
-          # Create deployment script - use simplified SSL-only version
-          cat > scripts/deploy.sh << EOF
-          $(cat artifacts/ec2-dns-ssl-only.txt)
+          # Create Route53 update script
+          cat > scripts/update_route53.sh << 'EOF'
+          #!/bin/bash
+          set -e
+
+          DOMAIN_NAME="$1"
+          EC2_IP="$2"
+
+          if [ -z "$DOMAIN_NAME" ] || [ -z "$EC2_IP" ]; then
+            echo "Usage: $0 <domain_name> <ec2_ip>"
+            exit 1
+          fi
+
+          echo "Updating Route53 DNS records for $DOMAIN_NAME to point to $EC2_IP"
+
+          # Get the hosted zone ID for the domain
+          HOSTED_ZONE_ID=$(aws route53 list-hosted-zones-by-name --dns-name "$DOMAIN_NAME" --query "HostedZones[?Name=='$DOMAIN_NAME.'].Id" --output text | sed 's/\/hostedzone\///')
+
+          if [ -z "$HOSTED_ZONE_ID" ]; then
+            echo "Error: Could not find Route53 hosted zone for $DOMAIN_NAME"
+            exit 1
+          fi
+
+          echo "Found hosted zone ID: $HOSTED_ZONE_ID"
+
+          # Create JSON for the change batch
+          CHANGE_BATCH='{
+            "Changes": [
+              {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                  "Name": "'$DOMAIN_NAME'",
+                  "Type": "A",
+                  "TTL": 300,
+                  "ResourceRecords": [
+                    {
+                      "Value": "'$EC2_IP'"
+                    }
+                  ]
+                }
+              },
+              {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                  "Name": "www.'$DOMAIN_NAME'",
+                  "Type": "A",
+                  "TTL": 300,
+                  "ResourceRecords": [
+                    {
+                      "Value": "'$EC2_IP'"
+                    }
+                  ]
+                }
+              },
+              {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                  "Name": "qa.'$DOMAIN_NAME'",
+                  "Type": "A",
+                  "TTL": 300,
+                  "ResourceRecords": [
+                    {
+                      "Value": "'$EC2_IP'"
+                    }
+                  ]
+                }
+              }
+            ]
+          }'
+
+          # Apply the changes
+          echo "Updating DNS records..."
+          CHANGE_ID=$(aws route53 change-resource-record-sets --hosted-zone-id "$HOSTED_ZONE_ID" --change-batch "$CHANGE_BATCH" --query "ChangeInfo.Id" --output text)
+
+          echo "DNS update submitted. Change ID: $CHANGE_ID"
+          echo "DNS changes may take up to 5-10 minutes to propagate."
+
+          echo "Verifying DNS records..."
+          aws route53 list-resource-record-sets --hosted-zone-id "$HOSTED_ZONE_ID" --query "ResourceRecordSets[?Name=='$DOMAIN_NAME.' || Name=='www.$DOMAIN_NAME.' || Name=='qa.$DOMAIN_NAME.']"
+          EOF
+          chmod +x scripts/update_route53.sh
+
+          # Create deployment script with SSL
+          cat > scripts/deploy.sh << 'EOF'
+          #!/bin/bash
+          set -e
+
+          # Get variables from environment
+          DOMAIN_NAME="$1"
+          if [ -z "$DOMAIN_NAME" ]; then
+            echo "Error: Domain name not provided"
+            exit 1
+          fi
+
+          # Get EC2 public IP if not provided
+          EC2_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4 || echo "")
+          if [ -z "$EC2_IP" ]; then
+            EC2_IP="$EC2_PUBLIC_IP"
+          fi
+
+          # Set QA subdomain as the main domain for this deployment
+          QA_DOMAIN="qa.$DOMAIN_NAME"
+
+          echo "Domain: $DOMAIN_NAME"
+          echo "QA Domain: $QA_DOMAIN"
+          echo "EC2 IP: $EC2_IP"
+
+          # Verify RDS connectivity
+          echo "Verifying RDS connectivity..."
+          echo "RDS Endpoint: $RDS_ENDPOINT"
+          if mysql -h $RDS_ENDPOINT -u $RDS_USERNAME -p$RDS_PASSWORD -e "SELECT 1" > /dev/null 2>&1; then
+            echo "✅ Database connection successful"
+          else
+            echo "⚠️ Warning: Cannot connect to RDS directly from EC2. Check security groups."
+            echo "Attempting database connection test via telnet..."
+            RDS_HOST=$(echo $RDS_ENDPOINT | cut -d':' -f1)
+            RDS_PORT=3306
+            timeout 5 bash -c "</dev/tcp/$RDS_HOST/$RDS_PORT" && echo "Port connectivity OK" || echo "Cannot connect to database port"
+          fi
+
+          # Pull the latest images
+          echo "Pulling latest images from ECR..."
+          sudo docker pull $ECR_URI/frontend:latest
+          sudo docker pull $ECR_URI/backend:latest
+
+          # Stop any running containers
+          echo "Stopping existing containers..."
+          sudo docker-compose down || true
+
+          # Create directories for Let's Encrypt
+          echo "Setting up Let's Encrypt directories..."
+          sudo mkdir -p /var/www/certbot
+          sudo mkdir -p /etc/letsencrypt
+
+          # Create nginx config for SSL
+          echo "Creating nginx configuration with SSL support..."
+          cat > nginx.conf << EOFNGINX
+          events {}
+
+          http {
+              include /etc/nginx/mime.types;
+              default_type application/octet-stream;
+              server_tokens off;
+
+              # Redirect HTTP to HTTPS
+              server {
+                  listen 80;
+                  server_name $QA_DOMAIN www.$QA_DOMAIN;
+                  
+                  # For Let's Encrypt
+                  location /.well-known/acme-challenge/ {
+                      root /var/www/certbot;
+                  }
+                  
+                  location / {
+                      return 301 https://\$host\$request_uri;
+                  }
+              }
+
+              # HTTPS server
+              server {
+                  listen 443 ssl;
+                  server_name $QA_DOMAIN www.$QA_DOMAIN;
+                  
+                  # SSL certificates
+                  ssl_certificate /etc/letsencrypt/live/$QA_DOMAIN/fullchain.pem;
+                  ssl_certificate_key /etc/letsencrypt/live/$QA_DOMAIN/privkey.pem;
+                  ssl_protocols TLSv1.2 TLSv1.3;
+                  
+                  # Frontend
+                  location / {
+                      root /usr/share/nginx/html;
+                      try_files \$uri /index.html;
+                  }
+
+                  # Backend APIs
+                  location ~ ^/(login|register|logout|game|search|favorite|recommendation) {
+                      proxy_pass http://backend:8080;
+                      proxy_set_header Host \$host;
+                      proxy_set_header X-Real-IP \$remote_addr;
+                      proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                      proxy_set_header X-Forwarded-Proto \$scheme;
+                  }
+
+                  # Static assets
+                  location /static/ {
+                      root /usr/share/nginx/html;
+                  }
+              }
+          }
+          EOFNGINX
+
+          # Create Dockerfile for frontend with SSL
+          echo "Creating Dockerfile for frontend with SSL..."
+          cat > Dockerfile.frontend.ssl << EOFDOCKER
+          FROM $ECR_URI/frontend:latest
+          COPY nginx.conf /etc/nginx/nginx.conf
+          EXPOSE 80 443
+          CMD ["nginx", "-g", "daemon off;"]
+          EOFDOCKER
+
+          # Build frontend with SSL
+          echo "Building frontend image with SSL support..."
+          sudo docker build -t frontend-ssl:latest -f Dockerfile.frontend.ssl .
+
+          # Create docker-compose file with certbot
+          echo "Creating docker-compose.yml with certbot..."
+          cat > docker-compose.yml << EOFCOMPOSE
+          version: "3.8"
+          services:
+            backend:
+              image: $ECR_URI/backend:latest
+              environment:
+                SPRING_DATASOURCE_URL: jdbc:mysql://$RDS_ENDPOINT/twitch?createDatabaseIfNotExist=true&allowPublicKeyRetrieval=true&useSSL=false
+                SPRING_DATASOURCE_USERNAME: $RDS_USERNAME
+                SPRING_DATASOURCE_PASSWORD: $RDS_PASSWORD
+                SPRING_PROFILES_ACTIVE: prod
+                # Debug options
+                LOGGING_LEVEL_ROOT: INFO
+                LOGGING_LEVEL_COM_LAIOFFER: DEBUG
+              ports:
+                - "8080:8080"
+              restart: always
+              networks:
+                - app-network
+              healthcheck:
+                test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+                interval: 30s
+                timeout: 10s
+                retries: 3
+                start_period: 40s
+            
+            frontend:
+              image: frontend-ssl:latest
+              volumes:
+                - /etc/letsencrypt:/etc/letsencrypt:ro
+                - /var/www/certbot:/var/www/certbot:ro
+              ports:
+                - "80:80"
+                - "443:443"
+              depends_on:
+                backend:
+                  condition: service_healthy
+              restart: always
+              networks:
+                - app-network
+            
+            certbot:
+              image: certbot/certbot
+              volumes:
+                - /etc/letsencrypt:/etc/letsencrypt
+                - /var/www/certbot:/var/www/certbot
+              entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait \$\${!}; done;'"
+
+          networks:
+            app-network:
+              driver: bridge
+          EOFCOMPOSE
+
+          # Verify docker-compose file syntax
+          echo "Verifying docker-compose.yml syntax..."
+          sudo docker-compose config
+
+          # Start services for ACME challenge
+          echo "Starting services for Let's Encrypt validation..."
+          sudo docker-compose up -d
+
+          # Wait for services to start
+          echo "Waiting for services to start..."
+          sleep 20
+
+          # Get certificate
+          echo "Obtaining SSL certificate for $QA_DOMAIN..."
+          sudo docker run --rm -v /etc/letsencrypt:/etc/letsencrypt -v /var/www/certbot:/var/www/certbot \
+            certbot/certbot certonly --webroot -w /var/www/certbot \
+            --email admin@$DOMAIN_NAME --agree-tos --no-eff-email \
+            -d $QA_DOMAIN -d www.$QA_DOMAIN --force-renewal
+
+          # Restart services
+          echo "Restarting services with SSL enabled..."
+          sudo docker-compose down
+          sudo docker-compose up -d
+
+          # Setup auto-renewal
+          echo "Setting up certificate auto-renewal..."
+          sudo bash -c 'echo "0 0,12 * * * root docker run --rm -v /etc/letsencrypt:/etc/letsencrypt -v /var/www/certbot:/var/www/certbot certbot/certbot renew --quiet" > /etc/cron.d/certbot-renew'
+
+          # Wait for services to start
+          echo "Waiting for services to come up fully..."
+          sleep 30
+
+          # Check container status
+          echo "Checking container status..."
+          sudo docker-compose ps
+
+          # Test backend health
+          echo "Testing backend health endpoint..."
+          curl -sk https://$QA_DOMAIN/actuator/health || echo "Backend health check failed"
+
+          echo "Deployment complete!"
+          echo "Your application is available at:"
+          echo "- HTTPS: https://$QA_DOMAIN"
+          echo "- HTTP: http://$QA_DOMAIN (redirects to HTTPS)"
+
+          echo "For troubleshooting:"
+          echo "- Check backend logs: sudo docker-compose logs backend"
+          echo "- Check frontend logs: sudo docker-compose logs frontend"
+          echo "- Check SSL certificate: sudo ls -l /etc/letsencrypt/live/$QA_DOMAIN/"
           EOF
           chmod +x scripts/deploy.sh
 
@@ -581,23 +886,25 @@ jobs:
         if: ${{ env.SSH_CONNECTION_SUCCESS == 'true' }}
         run: |
           EC2_IP="${{ secrets.EC2_QA_PUBLIC_IP }}"
-          EC2_PUBLIC_DNS="${{ secrets.EC2_QA_PUBLIC_DNS }}"
 
           echo "Copying deployment scripts..."
           scp -i labsuser.pem -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null scripts/setup_ec2.sh ec2-user@$EC2_IP:~/setup_ec2.sh
+          scp -i labsuser.pem -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null scripts/update_route53.sh ec2-user@$EC2_IP:~/update_route53.sh
           scp -i labsuser.pem -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null scripts/deploy.sh ec2-user@$EC2_IP:~/deploy.sh
 
           echo "Setting up EC2 instance..."
           ssh -i labsuser.pem -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ec2-user@$EC2_IP "AWS_REGION=${{ env.AWS_REGION }} AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} AWS_SESSION_TOKEN=${{ secrets.AWS_SESSION_TOKEN }} ECR_URI=${{ env.AWS_ECR_URI }} ./setup_ec2.sh"
 
+          echo "Updating Route53 records..."
+          ssh -i labsuser.pem -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ec2-user@$EC2_IP "AWS_REGION=${{ env.AWS_REGION }} AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} AWS_SESSION_TOKEN=${{ secrets.AWS_SESSION_TOKEN }} ./update_route53.sh mytwitch.software $EC2_IP"
+
           echo "Deploying application with SSL..."
-          ssh -i labsuser.pem -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ec2-user@$EC2_IP "ECR_URI=${{ env.AWS_ECR_URI }} RDS_ENDPOINT=${{ secrets.RDS_ENDPOINT }} RDS_USERNAME=${{ secrets.RDS_USERNAME }} RDS_PASSWORD=${{ secrets.RDS_PASSWORD }} ./deploy.sh $EC2_PUBLIC_DNS $EC2_IP"
+          ssh -i labsuser.pem -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ec2-user@$EC2_IP "ECR_URI=${{ env.AWS_ECR_URI }} RDS_ENDPOINT=${{ secrets.RDS_ENDPOINT }} RDS_USERNAME=${{ secrets.RDS_USERNAME }} RDS_PASSWORD=${{ secrets.RDS_PASSWORD }} EC2_PUBLIC_IP=$EC2_IP ./deploy.sh mytwitch.software"
 
       - name: Verify deployment
         if: ${{ env.SSH_CONNECTION_SUCCESS == 'true' }}
         run: |
           EC2_IP="${{ secrets.EC2_QA_PUBLIC_IP }}"
-          EC2_PUBLIC_DNS="${{ secrets.EC2_QA_PUBLIC_DNS }}"
 
           echo "Checking deployment status..."
           ssh -i labsuser.pem -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ec2-user@$EC2_IP "sudo docker ps -a"
@@ -606,11 +913,10 @@ jobs:
           ssh -i labsuser.pem -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ec2-user@$EC2_IP "sudo docker-compose logs --tail=30"
 
           echo "Application should be available at:"
-          echo "- HTTP: http://$EC2_PUBLIC_DNS"
-          echo "- HTTPS: https://$EC2_PUBLIC_DNS (if SSL setup succeeded)"
-          echo ""
-          echo "Note: Using Let's Encrypt with EC2 public DNS may have issues due to domain validation."
-          echo "If HTTPS is not working, the application will fall back to HTTP."
+          echo "- HTTPS: https://qa.mytwitch.software"
+          echo "- HTTP: http://qa.mytwitch.software (redirects to HTTPS)"
+
+          echo "Note: DNS changes may take 5-10 minutes to propagate. If you cannot access the site immediately, please wait and try again."
 
       - name: Deployment failed due to connection issues
         if: ${{ env.SSH_CONNECTION_SUCCESS == 'false' }}
