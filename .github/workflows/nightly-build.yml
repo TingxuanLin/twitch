@@ -466,7 +466,7 @@ jobs:
           echo "Terminating EC2 instance $EC2_INSTANCE_ID..."
           aws ec2 terminate-instances --instance-ids $EC2_INSTANCE_ID
 
-  deploy-qa:
+  ddeploy-qa:
     needs: integration-test
     runs-on: ubuntu-latest
     if: success()
