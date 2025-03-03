@@ -485,9 +485,9 @@ jobs:
 
       - name: Create deployment script
         run: |
-          # Create a simple deployment script
+          # Create a direct docker deployment script
           cat > deploy.sh << EOF
-          $(cat artifacts/simple-ec2-deploy.txt)
+          $(cat artifacts/direct-docker-deploy.txt)
           EOF
           chmod +x deploy.sh
 
@@ -523,9 +523,11 @@ jobs:
           scp -i labsuser.pem deploy.sh ec2-user@$EC2_IP:~/deploy.sh
 
           echo "Running deployment script..."
-          ssh -i labsuser.pem ec2-user@$EC2_IP "chmod +x ~/deploy.sh && AWS_REGION=${{ env.AWS_REGION }} ECR_URI=${{ env.AWS_ECR_URI }} RDS_ENDPOINT=${{ secrets.RDS_ENDPOINT }} RDS_USERNAME=${{ secrets.RDS_USERNAME }} RDS_PASSWORD=${{ secrets.RDS_PASSWORD }} ~/deploy.sh"
+          ssh -i labsuser.pem ec2-user@$EC2_IP "chmod +x ~/deploy.sh && AWS_REGION=${{ env.AWS_REGION }} ECR_URI=${{ env.AWS_ECR_URI }} RDS_ENDPOINT=${{ secrets.RDS_ENDPOINT }} RDS_USERNAME=${{ secrets.RDS_USERNAME }} RDS_PASSWORD=${{ secrets.RDS_PASSWORD }} ~/deploy.sh | tee deployment.log"
 
-          echo "Deployment completed"
+          echo "Deployment completed. Fetching logs..."
+          scp -i labsuser.pem ec2-user@$EC2_IP:~/deployment.log ./deployment.log
+          cat ./deployment.log
 
       - name: Verify deployment
         if: ${{ env.SSH_CONNECTION_SUCCESS == 'true' }}
@@ -546,7 +548,76 @@ jobs:
           ssh -i labsuser.pem ec2-user@$EC2_IP "curl -s -o /dev/null -w 'Frontend HTTP Status: %{http_code}\n' http://localhost:80 || echo 'Frontend not responding'"
           ssh -i labsuser.pem ec2-user@$EC2_IP "curl -s -o /dev/null -w 'Backend HTTP Status: %{http_code}\n' http://localhost:8080/actuator/health || echo 'Backend health check failed'"
 
-          echo "To troubleshoot deployment issues:"
-          echo "1. SSH into the EC2 instance: ssh -i labsuser.pem ec2-user@$EC2_IP"
-          echo "2. Check deployment logs: cat ~/deployment-*.log"
-          echo "3. Check container logs: sudo docker-compose logs"
+          if [[ "$(ssh -i labsuser.pem ec2-user@$EC2_IP 'sudo docker ps -q -f name=frontend' | wc -l)" -eq "1" && "$(ssh -i labsuser.pem ec2-user@$EC2_IP 'sudo docker ps -q -f name=backend' | wc -l)" -eq "1" ]]; then
+            echo "✅ Deployment successful - both containers are running"
+          else
+            echo "❌ Deployment issue - one or more containers are not running"
+            echo "Checking container logs for errors..."
+            ssh -i labsuser.pem ec2-user@$EC2_IP "sudo docker logs backend 2>&1 | tail -n 50"
+          fi
+
+      - name: Update Route53 after successful deployment
+        if: ${{ env.SSH_CONNECTION_SUCCESS == 'true' }}
+        run: |
+          EC2_IP="${{ secrets.EC2_QA_PUBLIC_IP }}"
+
+          echo "Creating Route53 update script..."
+          cat > update_route53.sh << 'EOF'
+          #!/bin/bash
+          set -e
+
+          DOMAIN_NAME="mytwitch.software"
+          EC2_IP="$1"
+
+          if [ -z "$EC2_IP" ]; then
+            echo "Usage: $0 <ec2_ip>"
+            exit 1
+          fi
+
+          echo "Updating Route53 DNS records for $DOMAIN_NAME to point to $EC2_IP"
+
+          # Get the hosted zone ID for the domain
+          HOSTED_ZONE_ID=$(aws route53 list-hosted-zones-by-name --dns-name "$DOMAIN_NAME" --query "HostedZones[?Name=='$DOMAIN_NAME.'].Id" --output text | sed 's/\/hostedzone\///')
+
+          if [ -z "$HOSTED_ZONE_ID" ]; then
+            echo "Error: Could not find Route53 hosted zone for $DOMAIN_NAME"
+            exit 1
+          fi
+
+          echo "Found hosted zone ID: $HOSTED_ZONE_ID"
+
+          # Create JSON for the change batch
+          CHANGE_BATCH='{
+            "Changes": [
+              {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                  "Name": "qa.'$DOMAIN_NAME'",
+                  "Type": "A",
+                  "TTL": 300,
+                  "ResourceRecords": [
+                    {
+                      "Value": "'$EC2_IP'"
+                    }
+                  ]
+                }
+              }
+            ]
+          }'
+
+          # Apply the changes
+          echo "Updating DNS records..."
+          CHANGE_ID=$(aws route53 change-resource-record-sets --hosted-zone-id "$HOSTED_ZONE_ID" --change-batch "$CHANGE_BATCH" --query "ChangeInfo.Id" --output text)
+
+          echo "DNS update submitted. Change ID: $CHANGE_ID"
+          echo "DNS changes may take up to 5-10 minutes to propagate."
+          EOF
+          chmod +x update_route53.sh
+
+          echo "Copying Route53 update script..."
+          scp -i labsuser.pem update_route53.sh ec2-user@$EC2_IP:~/update_route53.sh
+
+          echo "Running Route53 update script..."
+          ssh -i labsuser.pem ec2-user@$EC2_IP "chmod +x ~/update_route53.sh && AWS_REGION=${{ env.AWS_REGION }} AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} AWS_SESSION_TOKEN=${{ secrets.AWS_SESSION_TOKEN }} ~/update_route53.sh $EC2_IP"
+
+          echo "DNS updated. Application should be available at: http://qa.mytwitch.software"
