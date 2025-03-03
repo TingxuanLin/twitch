@@ -497,17 +497,15 @@ jobs:
         run: |
           echo "Testing SSH connection..."
           EC2_IP="${{ secrets.EC2_QA_PUBLIC_IP }}"
-          ssh -i labsuser.pem ec2-user@$EC2_IP "echo SSH connection successful"
-          if [ $? -eq 0 ]; then
-            echo "✅ SSH connection successful"
-            echo "SSH_CONNECTION_SUCCESS=true" >> $GITHUB_ENV
-          else
-            echo "❌ SSH connection failed"
+          ssh -i labsuser.pem ec2-user@$EC2_IP "echo SSH connection successful" || {
+            echo "Warning: SSH connection failed. Check if your EC2 instance is running and has the correct security group rules."
             echo "SSH_CONNECTION_SUCCESS=false" >> $GITHUB_ENV
-          fi
+            exit 0
+          }
+          echo "✅ SSH connection successful"
+          echo "SSH_CONNECTION_SUCCESS=true" >> $GITHUB_ENV
 
       - name: Create deployment script
-        if: ${{ env.SSH_CONNECTION_SUCCESS == 'true' }}
         run: |
           # Create a deployment script
           cat > deploy.sh << 'EOF'
@@ -531,9 +529,9 @@ jobs:
           sudo curl -L "https://github.com/docker/compose/releases/download/v2.20.3/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
           sudo chmod +x /usr/local/bin/docker-compose
 
-          # Login to ECR
-          # echo "Logging in to Amazon ECR..."
-          # aws ecr get-login-password --region $AWS_REGION | sudo docker login --username AWS --password-stdin $ECR_URI
+          # Login to ECR - using AWS credentials passed to this script
+          echo "Logging in to Amazon ECR..."
+          aws ecr get-login-password --region $AWS_REGION | sudo docker login --username AWS --password-stdin $ECR_URI
 
           # Create application directory
           mkdir -p ~/mytwitch-app
@@ -548,7 +546,7 @@ jobs:
               image: ${ECR_URI}/backend:latest
               restart: always
               environment:
-                SPRING_DATASOURCE_URL: jdbc:mysql://${RDS_ENDPOINT}:3306/twitch
+                SPRING_DATASOURCE_URL: jdbc:mysql://${RDS_ENDPOINT}:3306/twitch?allowPublicKeyRetrieval=true&useSSL=false
                 SPRING_DATASOURCE_USERNAME: ${RDS_USERNAME}
                 SPRING_DATASOURCE_PASSWORD: ${RDS_PASSWORD}
                 SPRING_JPA_HIBERNATE_DDL_AUTO: update
@@ -689,7 +687,7 @@ jobs:
               image: ${ECR_URI}/backend:latest
               restart: always
               environment:
-                SPRING_DATASOURCE_URL: jdbc:mysql://${RDS_ENDPOINT}:3306/twitch
+                SPRING_DATASOURCE_URL: jdbc:mysql://${RDS_ENDPOINT}:3306/twitch?allowPublicKeyRetrieval=true&useSSL=false
                 SPRING_DATASOURCE_USERNAME: ${RDS_USERNAME}
                 SPRING_DATASOURCE_PASSWORD: ${RDS_PASSWORD}
                 SPRING_JPA_HIBERNATE_DDL_AUTO: update
@@ -794,10 +792,23 @@ jobs:
           scp -i labsuser.pem deploy.sh update_route53.sh setup_ssl.sh ec2-user@$EC2_IP:~/
 
           echo "Running deployment script on EC2..."
-          ssh -i labsuser.pem ec2-user@$EC2_IP "chmod +x ~/deploy.sh ~/update_route53.sh ~/setup_ssl.sh && AWS_REGION=${{ env.AWS_REGION }} ECR_URI=${{ env.AWS_ECR_URI }} RDS_ENDPOINT=${{ secrets.RDS_ENDPOINT }} RDS_USERNAME=${{ secrets.RDS_USERNAME }} RDS_PASSWORD=${{ secrets.RDS_PASSWORD }} ~/deploy.sh | tee deployment.log"
+          ssh -i labsuser.pem ec2-user@$EC2_IP "chmod +x ~/deploy.sh ~/update_route53.sh ~/setup_ssl.sh && \
+            AWS_REGION=${{ env.AWS_REGION }} \
+            AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
+            AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
+            AWS_SESSION_TOKEN=${{ secrets.AWS_SESSION_TOKEN }} \
+            ECR_URI=${{ env.AWS_ECR_URI }} \
+            RDS_ENDPOINT=${{ secrets.RDS_ENDPOINT }} \
+            RDS_USERNAME=${{ secrets.RDS_USERNAME }} \
+            RDS_PASSWORD=${{ secrets.RDS_PASSWORD }} \
+            ~/deploy.sh | tee deployment.log"
 
           echo "Updating Route53 DNS records..."
-          ssh -i labsuser.pem ec2-user@$EC2_IP "AWS_REGION=${{ env.AWS_REGION }} AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} AWS_SESSION_TOKEN=${{ secrets.AWS_SESSION_TOKEN }} ~/update_route53.sh $EC2_IP"
+          ssh -i labsuser.pem ec2-user@$EC2_IP "AWS_REGION=${{ env.AWS_REGION }} \
+            AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
+            AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
+            AWS_SESSION_TOKEN=${{ secrets.AWS_SESSION_TOKEN }} \
+            ~/update_route53.sh $EC2_IP"
 
           echo "Deployment completed. Fetching logs..."
           scp -i labsuser.pem ec2-user@$EC2_IP:~/deployment.log ./deployment.log || echo "Could not fetch deployment log"
@@ -817,3 +828,34 @@ jobs:
 
           echo "Application URL: http://qa.mytwitch.software"
           echo "Note: Run the ~/setup_ssl.sh script on the EC2 instance to enable HTTPS with SSL/TLS."
+
+      - name: Manual Deployment Instructions (if automatic fails)
+        run: |
+          echo "If the automated deployment fails, you can manually deploy using these steps:"
+          echo ""
+          echo "1. SSH into your EC2 instance:"
+          echo "   ssh -i your-key.pem ec2-user@your-ec2-ip"
+          echo ""
+          echo "2. Install Docker:"
+          echo "   sudo yum update -y"
+          echo "   sudo yum install -y docker"
+          echo "   sudo systemctl start docker"
+          echo "   sudo systemctl enable docker"
+          echo "   sudo usermod -aG docker \$USER"
+          echo ""
+          echo "3. Create a docker-compose.yml file with your RDS connection information:"
+          echo "   mkdir -p ~/mytwitch-app"
+          echo "   cd ~/mytwitch-app"
+          echo "   nano docker-compose.yml"
+          echo ""
+          echo "4. Pull your frontend and backend images from ECR:"
+          echo "   aws ecr get-login-password --region YOUR_REGION | sudo docker login --username AWS --password-stdin YOUR_ECR_URI"
+          echo "   sudo docker pull YOUR_ECR_URI/frontend:latest"
+          echo "   sudo docker pull YOUR_ECR_URI/backend:latest"
+          echo ""
+          echo "5. Start your application:"
+          echo "   sudo docker-compose up -d"
+          echo ""
+          echo "6. Verify it's running:"
+          echo "   sudo docker-compose ps"
+          echo "   curl http://localhost:8080/actuator/health"
