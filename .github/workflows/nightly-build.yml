@@ -1,8 +1,6 @@
 name: Nightly Build
 
 on:
-  schedule:
-    - cron: "0 8 * * *" # This runs the workflow every night at midnight (UTC)
   workflow_dispatch: # You can also trigger it manually if needed
 
 permissions:
